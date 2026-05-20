@@ -98,12 +98,12 @@ end
 function get_smart_p0(os, n_samples=50)
     s = skip(SobolSeq([-π, 0.0], [π, 100.0]), n_samples)
     best_p = [0.0, 0.0]
-    best_val = -Inf
+    best_val = Inf
     
     for i in 1:n_samples
         p = next!(s)
         val = get_score(p, os)
-        if val > best_val
+        if val < best_val
             best_val = val
             best_p = p
         end
@@ -121,12 +121,11 @@ function find_next_wave!(x::AbstractVector, nx::Int64, os::OMPStruct)
     get_res!(x,nx,os)
 
     # Define an anonymous function for the score at x
-    # negative so that Optim.jl can minimize -score instead of maximizing score
     sc = view(os.scaling_buf, 1:2)
     sc[1], sc[2] = pi, 100.0
     lo = view(os.lo_buf, 1:2)
     up = view(os.up_buf, 1:2)
-    neg_score = params -> -get_score(params.*sc, os)
+    score = params -> get_score(params.*sc, os)
 
     # Starting wave guess
     n_sobol_samples = 40
@@ -136,7 +135,7 @@ function find_next_wave!(x::AbstractVector, nx::Int64, os::OMPStruct)
     lo[1], lo[2] = -pi/sc[1], 0.0/sc[2]     # Min angle, Min phase speed
     up[1], up[2] = pi/sc[1], 100.0/sc[2]    # Max angle, Max phase speed
     
-    df = OnceDifferentiable(neg_score, p0; autodiff=AutoForwardDiff())
+    df = OnceDifferentiable(score, p0; autodiff=AutoForwardDiff())
     p_results = optimize(df, lo, up, p0, Fminbox(LBFGS()))
     
     # new wave (th,c)
@@ -187,7 +186,7 @@ const SHARPEN_OPTIONS = Optim.Options(
     outer_iterations = 5,
     show_trace = true,
     extended_trace = true,
-    f_tol = 1e-6,
+    f_reltol = 1e-6,
     g_tol = 1e-6,
     allow_f_increases = true # Helpful for noisy ridges
 )
@@ -256,7 +255,7 @@ function sharpen!(x::Vector{Float64}, nx::Int64, reg::Float64, os::OMPStruct)
             x[i+2] *= -1
             x[i+1] += pi
         end
-        x[i+1] = mod2pi(x[i+1])-pi
+        x[i+1] = rem2pi(x[i+1], RoundNearest)
     end
     
     return nothing
@@ -394,7 +393,7 @@ function b_calc!(b_out::AbstractVector, wave_params::AbstractVector, wav::WavePr
         bb = bt
     end
 end
-
+#=
 function get_score(params::AbstractVector, os::OMPStruct)
     # Uses the Lindzen hack to get global gradient information by
     # tracking b instead of the gradient
@@ -433,6 +432,26 @@ function get_score(params::AbstractVector, os::OMPStruct)
 
     # score is abs(dot(cdf(b), res))
     return dot(tmp, res)
+end
+=#
+
+function get_score(params::AbstractVector, os::OMPStruct)
+    # Estimates a finite change in residual on adding a wave defined by params
+    # with a nonzero expected amplitude
+
+    # this should pull the right tmp to match params
+    tmp = get_tmp(os.tmp_cache, params)
+    fill!(tmp,0)
+
+    # fill tmp with finite-amplitude wave
+    f_exp = 0.5e-3
+    os.prop_AD!(tmp, [params[1], params[2], f_exp], os.wav, os.col)
+
+    # Compute change in residual
+    res = get_tmp(os.res, params)
+    out = -dot(tmp, res)
+    out += 0.5*sum(abs2, tmp)
+    return out
 end
 
 function L81_AD_wrapper!(flux_out::AbstractVector, wave_params::AbstractVector, wav::WaveProfile, col::ColumnProfile)

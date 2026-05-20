@@ -60,7 +60,7 @@ reg_param = 1e-8 # Choose a small physical penalty for testing
 nx = 0  
 fill!(x_test, 0.0)
 
-for iter = 1:2
+for iter = 1:3
     global nx = find_next_wave!(x_test, nx, os)
     #### DEBUG
     println("New x start \n", x_test[1:nx])
@@ -68,7 +68,7 @@ for iter = 1:2
     # plot this test wave alongside the residual
     get_res!(x_test,nx,os)
     res = get_tmp(os.res,1.0)  # give me the float
-    plot(reshape(os.fluxvec,(nz,2)),z,xlabel=["X residual (Pa)" "Y residual (Pa)"],ylabel="z (km)",label=nothing,layout=2)
+    plot(reshape(res,(nz,2)),z,xlabel=["X residual (Pa)" "Y residual (Pa)"],ylabel="z (km)",label=nothing,layout=2)
     savefig("fluxvec$(iter).png")
     # somewhat hackily get forward propagated vec from recon = res - os.fluxvec
     recon = os.fluxvec .- res
@@ -79,6 +79,19 @@ for iter = 1:2
     sharpen!(x_test, nx, reg_param, os)
 end
 nw_found = div(nx, 3)
+
+# Sort the waves in order of flux magnitude so we can rank them by importance
+ix = sortperm(test_fxs,rev=true)
+test_fxs = test_fxs[ix]
+test_cs = test_cs[ix]
+test_ths = test_ths[ix]
+
+x_true = zeros(3ntst)
+for i = 0:ntst-1
+   x_true[3i+1] = test_ths[i+1]
+   x_true[3i+2] = test_cs[i+1]
+   x_true[3i+3] = test_fxs[i+1]
+end
 
 #=
 println("Running full multi-wave reconstruction...")
@@ -108,9 +121,9 @@ residual_vs_truth = clean_signal .- reconstructed_signal
 r2_score = 1.0 - (sum(abs2, residual_vs_truth) / sum(abs2, clean_signal))
 println("Explained Variance (R² score relative to clean truth): $(round(r2_score * 100, digits=2))%")
 
-plot(reshape(clean_signal,(nz,2)),z,layout=2);savefig("signal.png")
-plot(reshape(reconstructed_signal,(nz,2)),z,layout=2);savefig("recon.png")
-plot(reshape(residual_vs_truth,(nz,2)),z,layout=2);savefig("residual.png")
+plot(reshape(clean_signal,(nz,2)),z,title="signal",layout=2);savefig("signal.png")
+plot(reshape(reconstructed_signal,(nz,2)),z,title="reconstruction",layout=2);savefig("recon.png")
+plot(reshape(residual_vs_truth,(nz,2)),z,title="true residual",layout=2);savefig("residual.png")
 
 # --- START TESTS ---
 @testset "Sliding Frank-Wolfe Architecture Recovery Test" begin
