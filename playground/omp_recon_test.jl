@@ -2,6 +2,7 @@ using Test
 using Optim
 using LinearAlgebra
 using Distributions # Needed for Gamma distribution
+# using LaTeXStrings
 
 include("omp.jl")
 
@@ -46,13 +47,24 @@ for i = 1:ntst
     clean_signal .+= target_flux
 end
 
-# Add noise and assign directly to your preallocated struct buffer
+# Add noise and assign directly to preallocated struct buffer
 err = randn(2nz)
 sigma = 0.05 * maximum(abs.(clean_signal)) 
 os.fluxvec .= clean_signal .+ (sigma .* err)
 
 # Allocate pre-sized storage vector for parameters as required by find_measure!
 x_test = zeros(3 * max_nw)
+
+# Display signal
+#=
+scatter(test_ths, test_cs, zcolor=test_fxs, 
+    xlabel=latexstring("\\theta (radians)"), ylabel=latexstring("c (m/s)"), 
+    label="Truth", markersize=5)
+=#
+scatter(test_ths, test_cs, zcolor=test_fxs, 
+    xlabel="theta (radians)", ylabel="c (m/s)", 
+    label="Truth", markersize=5)
+savefig("2d_signal.png")
 
 
 println("Testing sharpen!")
@@ -62,21 +74,61 @@ fill!(x_test, 0.0)
 
 for iter = 1:3
     global nx = find_next_wave!(x_test, nx, os)
+    
     #### DEBUG
     println("New x start \n", x_test[1:nx])
     
     # plot this test wave alongside the residual
     get_res!(x_test,nx,os)
     res = get_tmp(os.res,1.0)  # give me the float
-    plot(reshape(res,(nz,2)),z,xlabel=["X residual (Pa)" "Y residual (Pa)"],ylabel="z (km)",label=nothing,layout=2)
-    savefig("fluxvec$(iter).png")
     # somewhat hackily get forward propagated vec from recon = res - os.fluxvec
     recon = os.fluxvec .- res
-    plot(reshape(recon,(nz,2)),z,xlabel=["X recon (Pa)" "Y recon (Pa)"],ylabel="z (km)",label=nothing,layout=2)
-    savefig("recon$(iter).png")
+    plot(reshape(os.fluxvec,(nz,2)),z,xlabel=["X recon (Pa)" "Y recon (Pa)"],ylabel="z (km)",label="flux",layout=2)
+    plot!(reshape(recon,(nz,2)),z,label="recon")
+    savefig("recon$(iter)_t.png")
+
+    #plot score landscape
+    # Debug plotting
+# 1. Define the grid
+th_range = range(-π, π, length=100)
+c_range  = range(0.0, 100.0, length=100)
+
+# 2. Compute the score on the grid
+# We use the positive score (maximize) for the visualization
+score = [get_score([th, c], os) for th in th_range, c in c_range]
+
+# 3. Create the plot
+p1 = surface(th_range, c_range, score', 
+             xlabel="Angle (rad)", ylabel="Phase Speed (m/s)", zlabel="Score",
+             title="Score Surface around Truth", color=:viridis)
+
+p2 = heatmap(th_range, c_range, score', 
+             xlabel="Angle (rad)", ylabel="Phase Speed (m/s)",
+             title="Score Heatmap (Top View)", color=:viridis)
+             
+# Mark the truth and the found solution
+scatter!(p2, test_ths, test_cs, color=:red, label="Truth", markersize=5)
+scatter!(p2, x_test[1:3:3*iter-5], x_test[2:3:3*iter-4], color=:black, label="previous waves", markersize=5)
+scatter!(p2, [x_test[3*iter-2]], [x_test[3*iter-1]], color=:white, label="found wave", markersize=5)
+
+plot(p1, p2, layout=(1,2), size=(900, 400))
+savefig("diagnostic_plot$(iter).png")
     
     # 3. Expensive optimization step: Only run if the candidate passes the gatekeeper
     sharpen!(x_test, nx, reg_param, os)
+
+    # plot it again after sharpening
+    get_res!(x_test,nx,os)
+    res = get_tmp(os.res,1.0)  # give me the float
+    # somewhat hackily get forward propagated vec from recon = res - os.fluxvec
+    recon = os.fluxvec .- res
+    plot(reshape(os.fluxvec,(nz,2)),z,xlabel=["X recon (Pa)" "Y recon (Pa)"],ylabel="z (km)",label="flux",layout=2)
+    plot!(reshape(recon,(nz,2)),z,label="recon")
+    savefig("recon$(iter)_s.png")
+
+    scatter(test_ths, test_cs, color=:red, label="Truth", markersize=5)
+    scatter!(x_test[1:3:3*iter-2], x_test[2:3:3*iter-1], color=:black, label="sharpened soln", markersize=5)
+    savefig("spectrum$(iter).png")
 end
 nw_found = div(nx, 3)
 
@@ -121,8 +173,12 @@ residual_vs_truth = clean_signal .- reconstructed_signal
 r2_score = 1.0 - (sum(abs2, residual_vs_truth) / sum(abs2, clean_signal))
 println("Explained Variance (R² score relative to clean truth): $(round(r2_score * 100, digits=2))%")
 
-plot(reshape(clean_signal,(nz,2)),z,title="signal",layout=2);savefig("signal.png")
-plot(reshape(reconstructed_signal,(nz,2)),z,title="reconstruction",layout=2);savefig("recon.png")
+plot(reshape(clean_signal,(nz,2)),z,
+    xlabel=["X signal (Pa)" "Y signal (Pa)"],ylabel="z (km)",label=nothing,layout=2);
+savefig("signal.png")
+plot(reshape(reconstructed_signal,(nz,2)),z,
+    xlabel=["X recon (Pa)" "Y recon (Pa)"],ylabel="z (km)",label=nothing,layout=2);
+savefig("recon.png")
 plot(reshape(residual_vs_truth,(nz,2)),z,title="true residual",layout=2);savefig("residual.png")
 
 # --- START TESTS ---

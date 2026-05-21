@@ -8,6 +8,7 @@ using PreallocationTools
 using ADTypes
 using Sobol
 using LineSearches
+using LeastSquaresOptim
 
 include(expanduser("~/work/gw-inv/L81-2.jl"))
 
