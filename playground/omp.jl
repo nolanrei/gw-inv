@@ -112,7 +112,7 @@ function get_smart_p0(os, n_samples=50)
     return best_p
 end
 
-function find_next_wave!(x::AbstractVector, nx::Int64, os::OMPStruct)
+function find_next_wave!(x::AbstractVector, nx::Int64, f_guess::Float64, reg::Float64, os::OMPStruct)
     # In the OMP/sliding Frank-Wolfe formulation, finds the next 
     # wave to add to our support
 
@@ -126,7 +126,7 @@ function find_next_wave!(x::AbstractVector, nx::Int64, os::OMPStruct)
     sc[1], sc[2] = pi, 100.0
     lo = view(os.lo_buf, 1:2)
     up = view(os.up_buf, 1:2)
-    score = params -> get_score(params.*sc, os)
+    score = params -> get_score(params.*sc, f_guess, os)
 
     # Starting wave guess
     n_sobol_samples = 40
@@ -137,7 +137,7 @@ function find_next_wave!(x::AbstractVector, nx::Int64, os::OMPStruct)
     up[1], up[2] = pi/sc[1], 100.0/sc[2]    # Max angle, Max phase speed
     
     df = OnceDifferentiable(score, p0; autodiff=AutoForwardDiff())
-    p_results = optimize(df, lo, up, p0, Fminbox(LBFGS()))
+    p_results = optimize(df, lo, up, p0, Fminbox(LBFGS(linesearch=BackTracking())),Optim.Options(iterations=20))
     
     # new wave (th,c)
     pw0 = Optim.minimizer(p_results).*sc
@@ -159,7 +159,7 @@ function find_next_wave!(x::AbstractVector, nx::Int64, os::OMPStruct)
         for i in eachindex(tmp)
             val += (res[i] - tmp[i])^2 # res = (fluxvec - sum(g(xi))) - g(xnew)
         end
-        return 0.5 * val
+        return 0.5 * val + reg*f
     end
 
     # Starting flux guess -- only important that it be big enough
@@ -182,20 +182,11 @@ function find_next_wave!(x::AbstractVector, nx::Int64, os::OMPStruct)
     return nx
 end
 
-const SHARPEN_OPTIONS = Optim.Options(
-    iterations = 20,
-    outer_iterations = 5,
-    show_trace = true,
-    extended_trace = true,
-    f_reltol = 1e-6,
-    g_tol = 1e-6,
-    allow_f_increases = true # Helpful for noisy ridges
-)
-
 function sharpen!(x::Vector{Float64}, nx::Int64, reg::Float64, os::OMPStruct)
     
     # Fill buffers
     nw = div(nx,3)
+    nz2 = 2 * length(os.col.U)
     sc = view(os.scaling_buf, 1:nx)
     lo = view(os.lo_buf, 1:nx)
     up = view(os.up_buf, 1:nx)
@@ -206,57 +197,87 @@ function sharpen!(x::Vector{Float64}, nx::Int64, reg::Float64, os::OMPStruct)
         up[idx+1], up[idx+2], up[idx+3] = Inf, Inf, Inf
     end
 
-    # Objective function
+    # For LM, we output a vector of residuals instead of a scalar
+    # Length = Physical residuals + 1 regularization residual per wave
+    n_res = nz2 + nw 
+
+    # In-place residual function: f!(out, x)
     # let block freezes variables in scope so compiler is happier
-    Iw = let sc=sc, reg=reg, os=os, nx=nx
-        p_scaled -> begin
+    f_lsq! = let sc=sc, reg=reg, os=os, nx=nx, nz2=nz2, nw=nw
+        (out, p_scaled) -> begin
             tmp = view(get_tmp(os.tmp_cache2, p_scaled), 1:nx)
 
-            res = get_tmp(os.res, p_scaled)
-            
-            # In-place scaling: tmp = p_scaled .* sc
+            # We need to scale model variables back to real vars to call get_res!
             @inbounds for i in 1:nx
                 tmp[i] = p_scaled[i] * sc[i]
             end
             
+            # Compute physical residuals
             get_res!(tmp, nx, os)
+            res_phys = get_tmp(os.res, p_scaled)
             
-            val = 0.5*sum(abs2, res)
-
-            # L1 Regularization on fluxes (every 3rd element)
-            @inbounds for i = 3:3:nx
-                val += reg * p_scaled[i]
+            # 1. Fill the first part of `out` with physical residuals
+            @inbounds for i in 1:nz2
+                out[i] = res_phys[i]
             end
-            return val
+
+            # 2. Fill the end of `out` with "fake" residuals for L1 regularization
+            # NLLS minimizes 0.5 * sum(out^2). 
+            # We want: 0.5 * out_fake^2 = reg * flux
+            # Therefore: out_fake = sqrt(2 * reg * flux)
+            @inbounds for i = 1:nw
+                flux_scaled = p_scaled[3i]
+                # max(0.0, ...) ensures no DomainErrors if ForwardDiff steps slightly out of bounds
+                # and + 1e-12 ensures ForwardDiff doesn't break on x[i] = 0.0
+                out[nz2 + i] = sqrt(2.0 * reg * max(0.0, flux_scaled) + 1e-12)
+            end
+            
+            return out
         end
     end
 
-    # Optimize
-    # need to move x to scaled space
+    # Need to move x to scaled space...
     for i = 1:nx
         x[i] /= sc[i]
     end
-    # pointer-wrapped flat vectors avoid dynamic sizing issues (but are uglier than the devil's ass)
-    x_flat_view = unsafe_wrap(Vector{Float64}, pointer(x), nx)
-    lo_flat_view = unsafe_wrap(Vector{Float64}, pointer(os.lo_buf), nx)
-    up_flat_view = unsafe_wrap(Vector{Float64}, pointer(os.up_buf), nx)
 
-    df = OnceDifferentiable(Iw, x_flat_view; autodiff=AutoForwardDiff())
-    res = optimize(df, lo_flat_view, up_flat_view, x_flat_view, 
-        Fminbox(LBFGS(linesearch = LineSearches.HagerZhang())), SHARPEN_OPTIONS)
-    view(x,1:nx) .= Optim.minimizer(res)
+    ## Build and solve the least squares problem
+
+    # We need x to be a flat vector (not a view) of length nx, so we change its
+    # logical length without reallocating
+    lenx = length(x)
+    resize!(x,nx)
+    
+    prob = LeastSquaresProblem(
+        x = x, 
+        f! = f_lsq!, 
+        output_length = n_res, 
+        autodiff = :forward
+    )
+    
+    res = optimize!(prob, LevenbergMarquardt(), 
+                    lower = view(os.lo_buf,1:nx), 
+                    upper = view(os.up_buf,1:nx),
+                    iterations = 20, 
+                    show_trace = true, 
+                    x_tol = 1e-6, 
+                    f_tol = 1e-6)
+
+    view(x, 1:nx) .= res.minimizer
+    resize!(x,lenx)   # put x back to its full length
+
     # ...and back from scaled space
     for i = 1:nx
         x[i] *= sc[i]
     end
 
-    # convenience -- map angles and speeds back to [-pi, pi], [0,Inf]
+    # Convenience -- map angles and speeds back to [-pi, pi], [0,Inf]
     for i = 0:nw-1
-        if x[i+2] < 0
-            x[i+2] *= -1
-            x[i+1] += pi
+        if x[3i+2] < 0
+            x[3i+2] *= -1
+            x[3i+1] += pi
         end
-        x[i+1] = rem2pi(x[i+1], RoundNearest)
+        x[3i+1] = rem2pi(x[3i+1], RoundNearest)
     end
     
     return nothing
@@ -274,13 +295,18 @@ function find_measure!(x::Vector{Float64}, reg::Float64, os::OMPStruct)
     # Track the baseline error of the *current* model before adding anything
     err_baseline = cost(x, nx, 0.0, os)
 
+    # Keep track of our guess for the largest remaining wave's amplitude
+    f_guess = 0.5e-3   # 0.5 mPa at start
+    f_shrink = 0.1
+
     for iter = 1:MAXITER
         # Back up state
         @inbounds os.backup_buf[1:nx] .= view(x, 1:nx)
         nx_prev = nx
 
         # 1. Find new wave candidate (greedy step)
-        nx = find_next_wave!(x, nx, os)
+        nx = find_next_wave!(x, nx, f_guess, reg, os)
+        f_guess *= f_shrink
         #### DEBUG
         println("Iteration $iter: new x start \n", x[1:nx])
 
@@ -346,97 +372,7 @@ function get_score_ugly(params::AbstractVector, os::OMPStruct)
     return score_val[1]
 end
 
-# Lindzen-specific hack to get_score that makes it substantially nicer
-function b_calc!(b_out::AbstractVector, wave_params::AbstractVector, wav::WaveProfile, col::ColumnProfile)
-    th = wave_params[1]
-    c = wave_params[2]
-    # we don't use flux at all and want to optimize over only th and c
-
-    nz = length(col.U)
-
-    # We keep wav around for the wave parameters that we usually hold constant (absk, src)
-    absk = hypot(wav.k, wav.l)
-    cdir_1, cdir_2 = cos(th), sin(th)            # direction of wave propagation
-    vb = col.U[wav.src]*cdir_1 + col.V[wav.src]*cdir_2        # mean flow speed in direction of wave at src
-    bb = col.rho[wav.src]*0.5*absk*(c-vb)^3/col.N[wav.src]
-    sb = sign(c-vb)
-
-    # Loop from bottom to top of column, depositing momentum where it exceeds maximum stable transport
-    for lvl = wav.src:col.nlev
-        if lvl == col.nlev
-            vt = vb
-            bt = bb
-        else
-            vt = col.U[lvl+1]*cdir_1 + col.V[lvl+1]*cdir_2       # flow speed in direction cdir at top of cell
-            bt = col.rho[lvl+1] * 0.5*absk*(c-vt)^3/col.N[lvl+1]   # breaking condition -- maximum stable momentum transport
-        end
-
-        # flux_out depends on bb, so we want bb from this function
-        b_out[lvl] = bb
-
-        # everything below this actually modulates bt
-        
-        # If c-v at bottom and top of cell have different signs, there's a 
-        # critical layer somewhere in here and we need to break and dump all momentum
-    	vscale = 0.4  # should scale things such that 1m/s difference is tanh(2.5) = 0.986 
-    	sig_crit = 0.5*(1 + tanh(sb*(c-vt)/vscale))
-        bb *= sig_crit
-        bt *= sig_crit
-        
-        # In flux deposition mode, we deposit flux if flux > bb
-        # Here we want bb, so we need to keep a rolling min of bb
-        if abs(bb) < abs(bt)
-            # Ensure bt retains its sign, but is capped at the magnitude of bb
-            bt = sign(bt) * abs(bb)
-        end
-        
-        vb = vt
-        bb = bt
-    end
-end
-#=
-function get_score(params::AbstractVector, os::OMPStruct)
-    # Uses the Lindzen hack to get global gradient information by
-    # tracking b instead of the gradient
-    # cdf is the CDF of the probability distribution we apply to different
-    # fluxes when integrating the score over them
-
-    # this should pull the right tmp to match params
-    tmp = get_tmp(os.tmp_cache, params)
-    fill!(tmp,0)
-    nz = div(length(tmp),2)
-
-    # calculate b (only fills first half of tmp)
-    b_calc!(tmp, params, os.wav, os.col)
-
-    # replace b with cdf(b) -- this is the integral of dg/df over pdf(f)
-    # The expected gradient carries the sign of the wave flux, 
-    # but the CDF is evaluated on the magnitude of the breaking limit.
-    @inbounds for i in eachindex(tmp)
-        tmp[i] = sign(tmp[i]) * os.cdf(abs(tmp[i]))
-    end
-
-    # Need something here to penalize waves that don't break until the top
-    # Because otherwise they pretend to project equally well onto all localized residuals
-    res = get_tmp(os.res, params)
-    tmp ./= (0.1*length(tmp) + norm(tmp,1))
-    # tmp ./= ((params[2]/100.0)^2 + 1)
-
-    # And one last piece of the puzzle. So far we've only used th and c
-    # together as one variable, which collapses it to one DOF
-    # To reintroduce the second, we need to use the angle of the flux
-    th = params[1]
-    for i = 1:nz
-        tmp[nz+i] = sin(th)*tmp[i]
-        tmp[i]    = cos(th)*tmp[i]
-    end
-
-    # score is abs(dot(cdf(b), res))
-    return dot(tmp, res)
-end
-=#
-
-function get_score(params::AbstractVector, os::OMPStruct)
+function get_score(params::AbstractVector, f_guess::Float64, os::OMPStruct)
     # Estimates a finite change in residual on adding a wave defined by params
     # with a nonzero expected amplitude
 
@@ -445,8 +381,7 @@ function get_score(params::AbstractVector, os::OMPStruct)
     fill!(tmp,0)
 
     # fill tmp with finite-amplitude wave
-    f_exp = 0.5e-3
-    os.prop_AD!(tmp, [params[1], params[2], f_exp], os.wav, os.col)
+    os.prop_AD!(tmp, [params[1], params[2], f_guess], os.wav, os.col)
 
     # Compute change in residual
     res = get_tmp(os.res, params)
