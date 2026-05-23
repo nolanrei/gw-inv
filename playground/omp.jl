@@ -9,6 +9,7 @@ using ADTypes
 using Sobol
 using LineSearches
 using LeastSquaresOptim
+using BlackBoxOptim
 
 include(expanduser("~/work/gw-inv/L81-2.jl"))
 
@@ -26,7 +27,7 @@ mutable struct OMPStruct{T, F1, F2, C}
     tmp_cache2  :: C
 
     backup_buf  :: Vector{T}
-    scaling_buf :: Vector{T}
+    sc_buf :: Vector{T}
     lo_buf      :: Vector{T}
     up_buf      :: Vector{T}
     maxwaves    :: Int64
@@ -47,13 +48,13 @@ function OMPStruct(col, prop_AD!::F1, my_cdf::F2, wav; max_nw=200, fluxvec=nothi
     cache2 = DiffCache(zeros(3max_nw))
 
     backup_buf = zeros(3max_nw)
-    scaling_buf = zeros(3max_nw)
+    sc_buf = zeros(3max_nw)
     lo_buf = zeros(3max_nw)
     up_buf = zeros(3max_nw)
     
     return OMPStruct{Float64, F1, F2, typeof(cache)}(col, wav, prop_AD!, my_cdf, 
         fluxvec, res, res_cache, cache, cache2,
-        backup_buf, scaling_buf, lo_buf, up_buf, max_nw)
+        backup_buf, sc_buf, lo_buf, up_buf, max_nw)
 end
 
 function get_res!(x::AbstractVector, nx::Int64, os::OMPStruct)
@@ -96,88 +97,96 @@ function cost(x::AbstractVector, nx::Int64, reg::Float64, os::OMPStruct)
     return out
 end
 
-function get_smart_p0(os, n_samples=50)
-    s = skip(SobolSeq([-π, 0.0], [π, 100.0]), n_samples)
-    best_p = [0.0, 0.0]
-    best_val = Inf
-    
-    for i in 1:n_samples
-        p = next!(s)
-        val = get_score(p, os)
-        if val < best_val
-            best_val = val
-            best_p = p
-        end
-    end
-    return best_p
-end
-
-function find_next_wave!(x::AbstractVector, nx::Int64, f_guess::Float64, reg::Float64, os::OMPStruct)
+#=
+function find_next_wave!(x::AbstractVector, nx::Int64, reg::Float64, os::OMPStruct)
     # In the OMP/sliding Frank-Wolfe formulation, finds the next 
     # wave to add to our support
-
-    ## 1. Find the best (th, c) wave
+    tmp = get_tmp(os.tmp_cache, x)
+    params = zeros(3)
 
     # Get residual
     get_res!(x,nx,os)
+    res = get_tmp(os.res, x)
 
-    # Define an anonymous function for the score at x
-    sc = view(os.scaling_buf, 1:2)
-    sc[1], sc[2] = pi, 100.0
-    lo = view(os.lo_buf, 1:2)
-    up = view(os.up_buf, 1:2)
-    score = params -> get_score(params.*sc, f_guess, os)
+    # lower and upper bounds
+    lo = view(get_tmp(os.lo_buf,x),1:3)
+    up = view(get_tmp(os.up_buf,x),1:3)
+    sc = view(get_tmp(os.sc_buf,x),1:3)
+    sc[1],sc[2],sc[3] = 2pi,100.0,1e-3
+    fmax = log(1e-2/sc[3])
+    fmin = log(1e-7/sc[3])
+    nlsc3 = fmax-fmin
+    lo[1],lo[2],lo[3] = -0.5,0.0,fmin/nlsc3
+    up[1],up[2],up[3] = 0.5,1.0,fmax/nlsc3
+
+    resnorm = let os=os, params=params, tmp=tmp, res=res, reg=reg, sc=sc
+        p -> begin
+            params[1] = sc[1]*p[1]
+            params[2] = sc[2]*p[2]
+            params[3] = sc[3]*exp(nlsc3*p[3])  # log flux space
+            os.prop_AD!(tmp, params, os.wav, os.col)
+            out = 0.0
+            for i = eachindex(tmp)
+                out += (res[i] - tmp[i])^2
+            end
+            return 0.5*out + reg*params[3]
+        end
+    end
+
+    result = bboptimize(resnorm, SearchRange=[(lo[1],up[1]),(lo[2],up[2]),(lo[3],up[3])],
+                        Method=:adaptive_de_rand_1_bin, MaxFuncEvals=2000, PopulationSize=50)
+
+    x[nx+1:nx+3] .= best_candidate(result)
+    x[nx+1:nx+2] .*= sc[1:2]
+    x[nx+3] = sc[3]*exp(nlsc3*x[nx+3])
+    nx += 3
+    return nx
+end
+=#
+
+function find_next_wave!(x::AbstractVector, nx::Int64, reg::Float64, os::OMPStruct)
+    # In the OMP/sliding Frank-Wolfe formulation, finds the next 
+    # wave to add to our support
+    tmp = get_tmp(os.tmp_cache, x)
+    p_cur = zeros(3)
+
+    # Get residual
+    get_res!(x,nx,os)
+    res = get_tmp(os.res, x)
 
     # Starting wave guess
-    n_sobol_samples = 40
-    p0 = get_smart_p0(os, n_sobol_samples)./sc
-
-    # Run the optimization
-    lo[1], lo[2] = -pi/sc[1], 0.0/sc[2]     # Min angle, Min phase speed
-    up[1], up[2] = pi/sc[1], 100.0/sc[2]    # Max angle, Max phase speed
-    
-    df = OnceDifferentiable(score, p0; autodiff=AutoForwardDiff())
-    p_results = optimize(df, lo, up, p0, Fminbox(LBFGS(linesearch=BackTracking())),Optim.Options(iterations=20))
-    
-    # new wave (th,c)
-    pw0 = Optim.minimizer(p_results).*sc
-
-    if !Optim.converged(p_results)
-        @warn "Optimization failed to converge on a new wave."
-    end
-
-    ## 2. Now minimize residual norm over new wave flux for x + new wave
-
-    # Define new anonymous function to minimize
-    # Brent expects a scalar variable
-    resnorm = f -> begin
-        tmp = get_tmp(os.tmp_cache, f) # dual or float based on type of f
-        res = get_tmp(os.res, f)
-        os.prop_AD!(tmp, [pw0[1], pw0[2], f], os.wav, os.col)
-
-        val = 0.0
-        for i in eachindex(tmp)
-            val += (res[i] - tmp[i])^2 # res = (fluxvec - sum(g(xi))) - g(xnew)
+    n_sobol_samples = 100
+    s = skip(SobolSeq([-π, 0.0], [π, 100.0]), n_sobol_samples)
+    p0 = view(p_cur,1:2)
+    pbest = view(x,(nx+1):(nx+3))
+    cbest = Inf
+    for iter = 1:n_sobol_samples
+        next!(s,p0)
+        resnorm = let os=os, tmp=tmp, res=res, reg=reg, p_cur=p_cur
+            f -> begin
+                p_cur[3] = exp(f)     # p0 is the first two elements of tmp2 already
+                fill!(tmp,0)
+                os.prop_AD!(tmp, p_cur, os.wav, os.col)
+                out = 0.0
+                for i = eachindex(tmp)
+                    out += (res[i] - tmp[i])^2
+                end
+                return 0.5*out + reg*p_cur[3]
+            end
         end
-        return 0.5 * val + reg*f
+    
+        # Minimize
+        l = log(1e-8)
+        u = log(1e-2)   # maximum of 10 mPa (still stupid large)
+        f_results = optimize(resnorm, l, u, Brent())
+
+        fmin = Optim.minimum(f_results)
+        if fmin < cbest
+            pbest .= p0[1], p0[2], exp(Optim.minimizer(f_results))
+            cbest = fmin
+        end
     end
-
-    # Starting flux guess -- only important that it be big enough
-    f0 = [3e-3] # start at 3mPa and work down
-
-    # Minimize
-    l = 0.0
-    u = 15e-3   # maximum of 15 mPa (still stupid large)
-    f_results = optimize(resnorm, l, u, Brent())
-
-    if !Optim.converged(f_results)
-        @warn "Optimization failed to converge on flux for new wave."
-    end
-
-    # Add new wave to the end of preallocated x vector
-    # nx is length of x
-    x[nx+1], x[nx+2], x[nx+3] = pw0[1], pw0[2], Optim.minimizer(f_results)
-    nw = div(length(x), 3)
+     
     nx += 3
     return nx
 end
@@ -187,7 +196,7 @@ function sharpen!(x::Vector{Float64}, nx::Int64, reg::Float64, os::OMPStruct)
     # Fill buffers
     nw = div(nx,3)
     nz2 = 2 * length(os.col.U)
-    sc = view(os.scaling_buf, 1:nx)
+    sc = view(os.sc_buf, 1:nx)
     lo = view(os.lo_buf, 1:nx)
     up = view(os.up_buf, 1:nx)
     for i = 0:nw-1
@@ -198,8 +207,8 @@ function sharpen!(x::Vector{Float64}, nx::Int64, reg::Float64, os::OMPStruct)
     end
 
     # For LM, we output a vector of residuals instead of a scalar
-    # Length = Physical residuals + 1 regularization residual per wave
-    n_res = nz2 + nw 
+    # Length = Physical residuals + 2 regularization residual per wave
+    n_res = nz2 + 2nw
 
     # In-place residual function: f!(out, x)
     # let block freezes variables in scope so compiler is happier
@@ -229,7 +238,8 @@ function sharpen!(x::Vector{Float64}, nx::Int64, reg::Float64, os::OMPStruct)
                 flux_scaled = p_scaled[3i]
                 # max(0.0, ...) ensures no DomainErrors if ForwardDiff steps slightly out of bounds
                 # and + 1e-12 ensures ForwardDiff doesn't break on x[i] = 0.0
-                out[nz2 + i] = sqrt(2.0 * reg * max(0.0, flux_scaled) + 1e-12)
+                out[nz2 + 2i-1] = sqrt(2.0 * reg * max(0.0, flux_scaled) + 1e-12)
+                out[nz2 + 2i]   = 4e-7*p_scaled[3i-1]  # penalty to fast waves
             end
             
             return out

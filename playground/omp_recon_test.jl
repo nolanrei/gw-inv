@@ -7,7 +7,7 @@ using Distributions # Needed for Gamma distribution
 include("omp.jl")
 
 # --- GLOBAL SETUP FOR THE TEST FILE ---
-Random.seed!(86) 
+#Random.seed!(86) 
 
 sz = size(vars["Up"][1])
 xi, yi, ti = rand(1:sz[1]), rand(1:sz[2]), rand(1:sz[4])
@@ -34,7 +34,7 @@ test_cs = cm .+ (cp - cm) * rand(ntst)
 
 alpha = 2
 ref_flux = 1e-3        # 1 mPa
-mnfx = 0.1 * ref_flux  # mean flux
+mnfx = ref_flux  # mean flux
 test_fxs = rand(Gamma(alpha, mnfx / alpha), ntst)
 test_ths = 2pi * rand(ntst) .- pi
 
@@ -72,9 +72,12 @@ reg_param = 1e-8 # Choose a small physical penalty for testing
 nx = 0  
 fill!(x_test, 0.0)
 
-for iter = 1:3
-    global nx = find_next_wave!(x_test, nx, os)
-    
+# Keep track of our guess for max remaining wave flux
+f_guess = 0.5e-3
+f_shrink = 0.03
+
+for iter = 1:5
+    global nx = find_next_wave!(x_test, nx, reg_param, os)
     #### DEBUG
     println("New x start \n", x_test[1:nx])
     
@@ -88,14 +91,15 @@ for iter = 1:3
     savefig("recon$(iter)_t.png")
 
     #plot score landscape
-    # Debug plotting
+# Debug plotting
+get_res!(x_test,nx-3,os)
 # 1. Define the grid
 th_range = range(-π, π, length=100)
 c_range  = range(0.0, 100.0, length=100)
 
 # 2. Compute the score on the grid
 # We use the positive score (maximize) for the visualization
-score = [get_score([th, c], os) for th in th_range, c in c_range]
+score = [get_score([th, c], f_guess, os) for th in th_range, c in c_range]
 
 # 3. Create the plot
 p1 = surface(th_range, c_range, score', 
@@ -113,7 +117,9 @@ scatter!(p2, [x_test[3*iter-2]], [x_test[3*iter-1]], color=:white, label="found 
 
 plot(p1, p2, layout=(1,2), size=(900, 400))
 savefig("diagnostic_plot$(iter).png")
-    
+
+    # Update max wave flux guess
+    global f_guess *= f_shrink
     # 3. Expensive optimization step: Only run if the candidate passes the gatekeeper
     sharpen!(x_test, nx, reg_param, os)
 
