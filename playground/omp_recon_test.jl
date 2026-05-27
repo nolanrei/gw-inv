@@ -2,7 +2,8 @@ using Test
 using Optim
 using LinearAlgebra
 using Distributions # Needed for Gamma distribution
-# using LaTeXStrings
+using GaussianProcesses
+using LaTeXStrings
 
 include("omp.jl")
 
@@ -11,20 +12,17 @@ include("omp.jl")
 
 sz = size(vars["Up"][1])
 xi, yi, ti = rand(1:sz[1]), rand(1:sz[2]), rand(1:sz[4])
-
-# Distribution CDF parameterization
-λ = 1 / 1e-3  
-my_cdf = x -> 1.0 - exp(-λ * x)
+z = vars["oz"]
 
 # Initialize Column Profile
 col = ColumnProfile(vars["Up"][1][xi,yi,:,ti], vars["Vp"][1][xi,yi,:,ti], vars["N"], vars["rho"], nz, dz)
-kw = 2pi/5e5
+kw = 2pi/5e4
 src = 4
 wav = c_to_wave(0.0, [1.0; 0.0], kw, 0.0, src)
 
 # MAXITER limits how high the loop can search
 max_nw = 20
-os = OMPStruct(col, L81_AD_wrapper!, my_cdf, wav; max_nw=max_nw)
+os = OMPStruct(col, L81_AD_wrapper!, wav; max_nw=max_nw)
 
 # Synthetic Truth Generation
 ntst = 6
@@ -68,14 +66,14 @@ savefig("2d_signal.png")
 
 
 println("Testing sharpen!")
-reg_param = 1e-8 # Choose a small physical penalty for testing
+reg_param = 1e-9 # Choose a small physical penalty for testing
 nx = 0  
 fill!(x_test, 0.0)
+#nx = find_measure!(x_test,reg_param,os)
 
 # Keep track of our guess for max remaining wave flux
 f_guess = 0.5e-3
 f_shrink = 0.03
-
 for iter = 1:5
     global nx = find_next_wave!(x_test, nx, reg_param, os)
     #### DEBUG
@@ -136,6 +134,7 @@ savefig("diagnostic_plot$(iter).png")
     scatter!(x_test[1:3:3*iter-2], x_test[2:3:3*iter-1], color=:black, label="sharpened soln", markersize=5)
     savefig("spectrum$(iter).png")
 end
+
 nw_found = div(nx, 3)
 
 # Sort the waves in order of flux magnitude so we can rank them by importance

@@ -14,11 +14,10 @@ using BlackBoxOptim
 include(expanduser("~/work/gw-inv/L81-2.jl"))
 
 # T is the element type of the residual, F is the function, C is the Cache type
-mutable struct OMPStruct{T, F1, F2, C}
+mutable struct OMPStruct{T, F, C}
     col         :: ColumnProfile
     wav         :: WaveProfile
-    prop_AD!    :: F1
-    cdf         :: F2
+    prop_AD!    :: F
     fluxvec     :: Vector{T}
     
     res         :: C
@@ -27,13 +26,13 @@ mutable struct OMPStruct{T, F1, F2, C}
     tmp_cache2  :: C
 
     backup_buf  :: Vector{T}
-    sc_buf :: Vector{T}
+    sc_buf      :: Vector{T}
     lo_buf      :: Vector{T}
     up_buf      :: Vector{T}
     maxwaves    :: Int64
 end
 
-function OMPStruct(col, prop_AD!::F1, my_cdf::F2, wav; max_nw=200, fluxvec=nothing) where {F1, F2}
+function OMPStruct(col, prop_AD!::F, wav; max_nw=200, fluxvec=nothing) where F
     nz = length(col.U)
 
     if isnothing(fluxvec)
@@ -52,7 +51,7 @@ function OMPStruct(col, prop_AD!::F1, my_cdf::F2, wav; max_nw=200, fluxvec=nothi
     lo_buf = zeros(3max_nw)
     up_buf = zeros(3max_nw)
     
-    return OMPStruct{Float64, F1, F2, typeof(cache)}(col, wav, prop_AD!, my_cdf, 
+    return OMPStruct{Float64, F, typeof(cache)}(col, wav, prop_AD!, 
         fluxvec, res, res_cache, cache, cache2,
         backup_buf, sc_buf, lo_buf, up_buf, max_nw)
 end
@@ -113,7 +112,7 @@ function find_next_wave!(x::AbstractVector, nx::Int64, reg::Float64, os::OMPStru
     up = view(get_tmp(os.up_buf,x),1:3)
     sc = view(get_tmp(os.sc_buf,x),1:3)
     sc[1],sc[2],sc[3] = 2pi,100.0,1e-3
-    fmax = log(1e-2/sc[3])
+    fmax = log(1e-1/sc[3])
     fmin = log(1e-7/sc[3])
     nlsc3 = fmax-fmin
     lo[1],lo[2],lo[3] = -0.5,0.0,fmin/nlsc3
@@ -134,7 +133,7 @@ function find_next_wave!(x::AbstractVector, nx::Int64, reg::Float64, os::OMPStru
     end
 
     result = bboptimize(resnorm, SearchRange=[(lo[1],up[1]),(lo[2],up[2]),(lo[3],up[3])],
-                        Method=:adaptive_de_rand_1_bin, MaxFuncEvals=2000, PopulationSize=50)
+                        Method=:adaptive_de_rand_1_bin, MaxFuncEvals=10000, PopulationSize=100)
 
     x[nx+1:nx+3] .= best_candidate(result)
     x[nx+1:nx+2] .*= sc[1:2]
@@ -155,7 +154,7 @@ function find_next_wave!(x::AbstractVector, nx::Int64, reg::Float64, os::OMPStru
     res = get_tmp(os.res, x)
 
     # Starting wave guess
-    n_sobol_samples = 100
+    n_sobol_samples = 500
     s = skip(SobolSeq([-π, 0.0], [π, 100.0]), n_sobol_samples)
     p0 = view(p_cur,1:2)
     pbest = view(x,(nx+1):(nx+3))
@@ -177,7 +176,7 @@ function find_next_wave!(x::AbstractVector, nx::Int64, reg::Float64, os::OMPStru
     
         # Minimize
         l = log(1e-8)
-        u = log(1e-2)   # maximum of 10 mPa (still stupid large)
+        u = log(5e-2)   # maximum of 50 mPa (still stupid large)
         f_results = optimize(resnorm, l, u, Brent())
 
         fmin = Optim.minimum(f_results)
@@ -265,11 +264,11 @@ function sharpen!(x::Vector{Float64}, nx::Int64, reg::Float64, os::OMPStruct)
         autodiff = :forward
     )
     
-    res = optimize!(prob, LevenbergMarquardt(), 
+    res = LeastSquaresOptim.optimize!(prob, LevenbergMarquardt(), 
                     lower = view(os.lo_buf,1:nx), 
                     upper = view(os.up_buf,1:nx),
-                    iterations = 20, 
-                    show_trace = true, 
+                    #iterations = 20, 
+                    #show_trace = true, 
                     x_tol = 1e-6, 
                     f_tol = 1e-6)
 
@@ -315,7 +314,7 @@ function find_measure!(x::Vector{Float64}, reg::Float64, os::OMPStruct)
         nx_prev = nx
 
         # 1. Find new wave candidate (greedy step)
-        nx = find_next_wave!(x, nx, f_guess, reg, os)
+        nx = find_next_wave!(x, nx, reg, os)
         f_guess *= f_shrink
         #### DEBUG
         println("Iteration $iter: new x start \n", x[1:nx])
