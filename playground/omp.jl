@@ -19,6 +19,7 @@ mutable struct OMPStruct{T, F, C}
     wav         :: WaveProfile
     prop_AD!    :: F
     fluxvec     :: Vector{T}
+    ksig        :: T
     
     res         :: C
     res_cache   :: C
@@ -52,7 +53,7 @@ function OMPStruct(col, prop_AD!::F, wav; max_nw=200, fluxvec=nothing) where F
     up_buf = zeros(3max_nw)
     
     return OMPStruct{Float64, F, typeof(cache)}(col, wav, prop_AD!, 
-        fluxvec, res, res_cache, cache, cache2,
+        fluxvec, 20.0, res, res_cache, cache, cache2,
         backup_buf, sc_buf, lo_buf, up_buf, max_nw)
 end
 
@@ -70,7 +71,7 @@ function get_res!(x::AbstractVector, nx::Int64, os::OMPStruct)
         
         # propagate wave i
         fill!(tmp, 0)
-        os.prop_AD!(tmp, p_i, os.wav, os.col)
+        os.prop_AD!(tmp, p_i, os.wav, os.col; ksig=os.ksig)
         
         @inbounds for j = 1:2nz
             res[j] -= tmp[j]
@@ -123,7 +124,7 @@ function find_next_wave!(x::AbstractVector, nx::Int64, reg::Float64, os::OMPStru
             params[1] = sc[1]*p[1]
             params[2] = sc[2]*p[2]
             params[3] = sc[3]*exp(nlsc3*p[3])  # log flux space
-            os.prop_AD!(tmp, params, os.wav, os.col)
+            os.prop_AD!(tmp, params, os.wav, os.col; ksig=os.ksig)
             out = 0.0
             for i = eachindex(tmp)
                 out += (res[i] - tmp[i])^2
@@ -154,7 +155,7 @@ function find_next_wave!(x::AbstractVector, nx::Int64, reg::Float64, os::OMPStru
     res = get_tmp(os.res, x)
 
     # Starting wave guess
-    n_sobol_samples = 500
+    n_sobol_samples = 100
     s = skip(SobolSeq([-π, 0.0], [π, 100.0]), n_sobol_samples)
     p0 = view(p_cur,1:2)
     pbest = view(x,(nx+1):(nx+3))
@@ -165,7 +166,7 @@ function find_next_wave!(x::AbstractVector, nx::Int64, reg::Float64, os::OMPStru
             f -> begin
                 p_cur[3] = exp(f)     # p0 is the first two elements of tmp2 already
                 fill!(tmp,0)
-                os.prop_AD!(tmp, p_cur, os.wav, os.col)
+                os.prop_AD!(tmp, p_cur, os.wav, os.col; ksig=os.ksig)
                 out = 0.0
                 for i = eachindex(tmp)
                     out += (res[i] - tmp[i])^2
@@ -192,95 +193,145 @@ end
 
 function sharpen!(x::Vector{Float64}, nx::Int64, reg::Float64, os::OMPStruct)
     
-    # Fill buffers
-    nw = div(nx,3)
+    nw = div(nx, 3)
     nz2 = 2 * length(os.col.U)
     sc = view(os.sc_buf, 1:nx)
     lo = view(os.lo_buf, 1:nx)
     up = view(os.up_buf, 1:nx)
+    
     for i = 0:nw-1
         idx = 3i
         sc[idx+1], sc[idx+2], sc[idx+3] = π, 100.0, 1e-3
-        lo[idx+1], lo[idx+2], lo[idx+3] = -Inf, -Inf, 0.0
-        up[idx+1], up[idx+2], up[idx+3] = Inf, Inf, Inf
+        lo[idx+1], lo[idx+2], lo[idx+3] = -Inf, -150/sc[idx+2], 0.0
+        up[idx+1], up[idx+2], up[idx+3] = Inf, 150/sc[idx+2], Inf
     end
 
-    # For LM, we output a vector of residuals instead of a scalar
-    # Length = Physical residuals + 2 regularization residual per wave
-    n_res = nz2 + 2nw
+    small = 1e-7
+    x[nx] = (x[nx] < small ? x[nx] : small)
 
-    # In-place residual function: f!(out, x)
-    # let block freezes variables in scope so compiler is happier
-    f_lsq! = let sc=sc, reg=reg, os=os, nx=nx, nz2=nz2, nw=nw
+    n_res = nz2 + 2nw
+    
+    # Trackers for closure
+    current_reg = Ref(reg)
+    i_of = Ref(0)
+
+    f_lsq! = let sc=sc, current_reg=current_reg, i_of=i_of, os=os, nx=nx, nz2=nz2, nw=nw, x=x
         (out, p_scaled) -> begin
+            n_p = length(p_scaled)
+            ci_of = i_of[]
+
             tmp = view(get_tmp(os.tmp_cache2, p_scaled), 1:nx)
 
-            # We need to scale model variables back to real vars to call get_res!
+            # fill all elements with constant baseline
             @inbounds for i in 1:nx
-                tmp[i] = p_scaled[i] * sc[i]
+                tmp[i] = x[i] * sc[i]
             end
             
-            # Compute physical residuals
+            # overwrite only the active window
+            @inbounds for i in 1:n_p
+                idx = ci_of + i
+                tmp[idx] = p_scaled[i] * sc[idx]
+            end
+            
             get_res!(tmp, nx, os)
             res_phys = get_tmp(os.res, p_scaled)
             
-            # 1. Fill the first part of `out` with physical residuals
             @inbounds for i in 1:nz2
                 out[i] = res_phys[i]
             end
 
-            # 2. Fill the end of `out` with "fake" residuals for L1 regularization
-            # NLLS minimizes 0.5 * sum(out^2). 
-            # We want: 0.5 * out_fake^2 = reg * flux
-            # Therefore: out_fake = sqrt(2 * reg * flux)
+            reg_val = current_reg[]
+
+            # 3. Regularization routing
             @inbounds for i = 1:nw
-                flux_scaled = p_scaled[3i]
-                # max(0.0, ...) ensures no DomainErrors if ForwardDiff steps slightly out of bounds
-                # and + 1e-12 ensures ForwardDiff doesn't break on x[i] = 0.0
-                out[nz2 + 2i-1] = sqrt(2.0 * reg * max(0.0, flux_scaled) + 1e-12)
-                out[nz2 + 2i]   = 4e-7*p_scaled[3i-1]  # penalty to fast waves
+                idx_flux = 3i
+                idx_c = 3i - 1
+                
+                # Check if this wave falls inside the active optimization window
+                if ci_of < idx_flux <= ci_of + n_p
+                    flux_scaled = p_scaled[idx_flux - ci_of]
+                    c_scaled = p_scaled[idx_c - ci_of]
+                else
+                    flux_scaled = x[idx_flux]
+                    c_scaled = x[idx_c]
+                end
+
+                out[nz2 + 2i-1] = sqrt(2.0 * reg_val * max(0.0, flux_scaled) + 1e-12)
+                out[nz2 + 2i]   = 4e-7 * c_scaled
             end
             
             return out
         end
     end
 
-    # Need to move x to scaled space...
+    # Scale to solver space
     for i = 1:nx
         x[i] /= sc[i]
     end
 
-    ## Build and solve the least squares problem
-
-    # We need x to be a flat vector (not a view) of length nx, so we change its
-    # logical length without reallocating
     lenx = length(x)
-    resize!(x,nx)
     
-    prob = LeastSquaresProblem(
-        x = x, 
+    # =========================================================================
+    # PHASE 1: Smooth Optimization Landscape (Active Window Only)
+    # =========================================================================
+    os.ksig = 5.0
+    current_reg[] = 0.0
+
+    # Determine window size and offset
+    nx_a = nw == 1 ? 3 : 6
+    i_of[] = nx - nx_a
+    
+    # Use unsafe_wrap to trick the solver into accepting a standard Vector
+    # pointer(x, idx) is 1-based, so we add 1 to the offset
+    x_active = unsafe_wrap(Vector{Float64}, pointer(x, i_of[] + 1), nx_a)
+    
+    prob_smooth = LeastSquaresProblem(
+        x = x_active, 
         f! = f_lsq!, 
         output_length = n_res, 
         autodiff = :forward
     )
     
-    res = LeastSquaresOptim.optimize!(prob, LevenbergMarquardt(), 
-                    lower = view(os.lo_buf,1:nx), 
-                    upper = view(os.up_buf,1:nx),
-                    #iterations = 20, 
-                    #show_trace = true, 
+    res_smooth = LeastSquaresOptim.optimize!(prob_smooth, LevenbergMarquardt(), 
+                    lower = view(os.lo_buf, (i_of[] + 1):nx), 
+                    upper = view(os.up_buf, (i_of[] + 1):nx),
+                    #iterations = 5, 
                     x_tol = 1e-6, 
                     f_tol = 1e-6)
 
-    view(x, 1:nx) .= res.minimizer
-    resize!(x,lenx)   # put x back to its full length
+    # Write back the results from the active window
+    x_active .= res_smooth.minimizer
 
-    # ...and back from scaled space
+    # =========================================================================
+    # PHASE 2: Sharp/Physical Optimization Landscape (All Waves)
+    # =========================================================================
+    os.ksig = 20.0
+    current_reg[] = reg
+    i_of[] = 0  # Reset offset to 0 so the active window is the whole array
+
+    resize!(x, nx)
+    
+    prob_sharp = LeastSquaresProblem(
+        x = x, 
+        f! = f_lsq!, 
+        output_length = n_res, 
+        autodiff = :forward
+    )
+
+    res_sharp = LeastSquaresOptim.optimize!(prob_sharp, LevenbergMarquardt(), 
+                    lower = view(os.lo_buf, 1:nx), 
+                    upper = view(os.up_buf, 1:nx),
+                    x_tol = 1e-6, 
+                    f_tol = 1e-6)
+
+    view(x, 1:nx) .= res_sharp.minimizer
+    resize!(x, lenx)
+
+    # Back from scaled space
     for i = 1:nx
         x[i] *= sc[i]
     end
 
-    # Convenience -- map angles and speeds back to [-pi, pi], [0,Inf]
     for i = 0:nw-1
         if x[3i+2] < 0
             x[3i+2] *= -1
@@ -399,9 +450,13 @@ function get_score(params::AbstractVector, f_guess::Float64, os::OMPStruct)
     return out
 end
 
-function L81_AD_wrapper!(flux_out::AbstractVector, wave_params::AbstractVector, wav::WaveProfile, col::ColumnProfile)
+function L81_AD_wrapper!(flux_out::AbstractVector, wave_params::AbstractVector, 
+        wav::WaveProfile, col::ColumnProfile; ksig::Float64=20.0)
     # Computes L81(flux*wave) and d/dflux L81(flux*wave)
     # Reformats inputs so automatic differentiation can do its thing
+
+    # Get the underlying type (will be Float64 normally, or Dual during AD)
+    T = eltype(wave_params)
 
     th = wave_params[1]
     c = wave_params[2]
@@ -409,8 +464,8 @@ function L81_AD_wrapper!(flux_out::AbstractVector, wave_params::AbstractVector, 
 
     # softening the discontinuities in the gradient by replacing
     # if statements with sigmoids
-    ksig = 20   # sigmoid sensitivity
-    tiny = 1e-15  # for scaling
+    #ksig = 20   # sigmoid sensitivity
+    tiny = T(1e-15)  # for scaling
 
     nz = length(col.U)
 
@@ -421,6 +476,8 @@ function L81_AD_wrapper!(flux_out::AbstractVector, wave_params::AbstractVector, 
     momsign = sign(c-vb)         # flux has to be in direction c-v_src
     bb = col.rho[wav.src]*0.5*absk*(c-vb)^3/col.N[wav.src]
     sb = sign(c-vb)
+
+    bmin = T(Inf)
     
     # Loop from bottom to top of column, depositing momentum where it exceeds maximum stable transport
     for lvl = wav.src:col.nlev
@@ -436,6 +493,14 @@ function L81_AD_wrapper!(flux_out::AbstractVector, wave_params::AbstractVector, 
             vt = col.U[lvl+1]*cdir_1 + col.V[lvl+1]*cdir_2       # flow speed in direction cdir at top of cell
             bt = col.rho[lvl+1] * 0.5*absk*(c-vt)^3/col.N[lvl+1]   # breaking condition -- maximum stable momentum transport
         end
+
+        # Compute b(z) instead of b-tilde(z)
+        if abs(bb) < bmin
+            bmin = abs(bb)
+        else
+            bb = sign(bb)*bmin
+        end
+        
         # If c-v at bottom and top of cell have different signs, there's a 
         # critical layer somewhere in here and we need to break and dump all momentum
         vscale = 0.4  # should scale things such that 1m/s difference is tanh(2.5) = 0.986 
