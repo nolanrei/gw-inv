@@ -33,7 +33,7 @@ mutable struct OMPStruct{T, F, C}
     maxwaves    :: Int64
 end
 
-function OMPStruct(col, prop_AD!::F, wav; max_nw=200, fluxvec=nothing) where F
+function OMPStruct(col, prop_AD!::F, wav; max_nw=20, fluxvec=nothing) where F
     nz = length(col.U)
 
     if isnothing(fluxvec)
@@ -57,7 +57,7 @@ function OMPStruct(col, prop_AD!::F, wav; max_nw=200, fluxvec=nothing) where F
         backup_buf, sc_buf, lo_buf, up_buf, max_nw)
 end
 
-function get_res!(x::AbstractVector, nx::Int64, os::OMPStruct)
+function get_res!(x::AbstractVector, nx::Int64, os::OMPStruct; ksig::Float64=os.ksig)
     nz = length(os.col.U)
     tmp = get_tmp(os.res_cache, x) 
 
@@ -71,7 +71,7 @@ function get_res!(x::AbstractVector, nx::Int64, os::OMPStruct)
         
         # propagate wave i
         fill!(tmp, 0)
-        os.prop_AD!(tmp, p_i, os.wav, os.col; ksig=os.ksig)
+        os.prop_AD!(tmp, p_i, os.wav, os.col; ksig)
         
         @inbounds for j = 1:2nz
             res[j] -= tmp[j]
@@ -151,8 +151,10 @@ function find_next_wave!(x::AbstractVector, nx::Int64, reg::Float64, os::OMPStru
     p_cur = zeros(3)
 
     # Get residual
-    get_res!(x,nx,os)
+    ksig_smooth = 10.0        # low value here smooths reconstruction
+    get_res!(x,nx,os; ksig=ksig_smooth)
     res = get_tmp(os.res, x)
+    nz = length(os.col.U)
 
     # Starting wave guess
     n_sobol_samples = 100
@@ -166,7 +168,7 @@ function find_next_wave!(x::AbstractVector, nx::Int64, reg::Float64, os::OMPStru
             f -> begin
                 p_cur[3] = exp(f)     # p0 is the first two elements of tmp2 already
                 fill!(tmp,0)
-                os.prop_AD!(tmp, p_cur, os.wav, os.col; ksig=os.ksig)
+                os.prop_AD!(tmp, p_cur, os.wav, os.col; ksig=ksig_smooth)
                 out = 0.0
                 for i = eachindex(tmp)
                     out += (res[i] - tmp[i])^2
@@ -219,6 +221,7 @@ function sharpen!(x::Vector{Float64}, nx::Int64, reg::Float64, os::OMPStruct)
         (out, p_scaled) -> begin
             n_p = length(p_scaled)
             ci_of = i_of[]
+            c_sm = sm[]
 
             tmp = view(get_tmp(os.tmp_cache2, p_scaled), 1:nx)
 
@@ -233,7 +236,7 @@ function sharpen!(x::Vector{Float64}, nx::Int64, reg::Float64, os::OMPStruct)
                 tmp[idx] = p_scaled[i] * sc[idx]
             end
             
-            get_res!(tmp, nx, os)
+            get_res!(tmp, nx, os; ksig=os.ksig)
             res_phys = get_tmp(os.res, p_scaled)
             
             @inbounds for i in 1:nz2
