@@ -25,6 +25,7 @@ mutable struct OMPStruct{T, F, C}
     res_cache   :: C
     tmp_cache   :: C        # holds a DiffCache instead of a Vector
     tmp_cache2  :: C
+    x_copy      :: C
 
     backup_buf  :: Vector{T}
     sc_buf      :: Vector{T}
@@ -46,6 +47,7 @@ function OMPStruct(col, prop_AD!::F, wav; max_nw=20, fluxvec=nothing) where F
     cache = DiffCache(zeros(2nz))
     res_cache = DiffCache(zeros(2nz))   # special one just for get_res!
     cache2 = DiffCache(zeros(3max_nw))
+    xcache = DiffCache(zeros(3max_nw))
 
     backup_buf = zeros(3max_nw)
     sc_buf = zeros(3max_nw)
@@ -53,7 +55,7 @@ function OMPStruct(col, prop_AD!::F, wav; max_nw=20, fluxvec=nothing) where F
     up_buf = zeros(3max_nw)
     
     return OMPStruct{Float64, F, typeof(cache)}(col, wav, prop_AD!, 
-        fluxvec, 20.0, res, res_cache, cache, cache2,
+        fluxvec, 20.0, res, res_cache, cache, cache2, xcache,
         backup_buf, sc_buf, lo_buf, up_buf, max_nw)
 end
 
@@ -208,9 +210,6 @@ function sharpen!(x::Vector{Float64}, nx::Int64, reg::Float64, os::OMPStruct)
         up[idx+1], up[idx+2], up[idx+3] = Inf, 150/sc[idx+2], Inf
     end
 
-    small = 1e-7
-    x[nx] = (x[nx] < small ? x[nx] : small)
-
     n_res = nz2 + 2nw
     
     # Trackers for closure
@@ -346,6 +345,59 @@ function sharpen!(x::Vector{Float64}, nx::Int64, reg::Float64, os::OMPStruct)
     return nothing
 end
 
+function test_jump!(x::Vector{Float64}, nx::Int64, dx::Float64, f0::Float64, reg::Float64, os::OMPStruct)
+    ### Randomly perturb, sharpen, accept/reject based on relative quality
+    ### x, nx -- solution so far
+    ### dx    -- magnitude of perturbations to try
+    ### f0    -- objective function at x,nx (to avoid recomputing it each test_jump!)
+    ### reg   -- regularization parameter
+    ### os    -- the struct holding everything defining a problem
+    nw = div(nx, 3)
+    nz2 = 2 * length(os.col.U)
+    sc = view(os.sc_buf, 1:nx)
+    lo = view(os.lo_buf, 1:nx)
+    up = view(os.up_buf, 1:nx)
+    xc = get_tmp(os.xcache, x)
+    tmp = view(get_tmp(os.tmp_cache2, x), 1:nx)
+    
+    for i = 0:nw-1
+        idx = 3i
+        sc[idx+1], sc[idx+2], sc[idx+3] = π, 100.0, 1e-3
+        lo[idx+1], lo[idx+2], lo[idx+3] = -Inf, -150/sc[idx+2], 0.0
+        up[idx+1], up[idx+2], up[idx+3] = Inf, 150/sc[idx+2], Inf
+    end
+
+    ## Copy x to xc and add perturbation
+    for i = 1:nx
+        xc[i] = x[i]
+    end
+    # perturbation
+    for i = 1:nx
+        tmp[i] = dx*randn()
+    end
+    tmp .*= sc      # scale perturbation
+    # add perturbation and clamp so xc is inside domain
+    for i = 1:nx
+        xc[i] = min(up[i]*sc[i], max(lo[i]*sc[i], xc[i] + tmp[i]))
+    end
+
+    ## Sharpen the perturbed solution
+    sharpen!(xc, nx, reg, os)
+
+    ## Check to see which solution is better
+    f1 = cost(xc, nx, reg, os)
+
+    # if f1 < f0, we accept the new solution
+    if f1 < f0
+        for i = 1:nx
+            x[i] = xc[i]
+        end
+    else
+        f1 = f0   # otherwise reject test
+    end
+    return f1  # so the next test_jump! can use the new cost without recomputing it
+end
+
 function find_measure!(x::Vector{Float64}, reg::Float64, os::OMPStruct)
     nz2 = 2 * length(os.col.U)
     nx = 0  
@@ -355,45 +407,45 @@ function find_measure!(x::Vector{Float64}, reg::Float64, os::OMPStruct)
     BIC_prev = Inf
     nx_best = 0 
 
+    dx = 0.2
+    dx_shrink = 0.7
+
     # Track the baseline error of the *current* model before adding anything
     err_baseline = cost(x, nx, 0.0, os)
-
-    # Keep track of our guess for the largest remaining wave's amplitude
-    f_guess = 0.5e-3   # 0.5 mPa at start
-    f_shrink = 0.1
 
     for iter = 1:MAXITER
         # Back up state
         @inbounds os.backup_buf[1:nx] .= view(x, 1:nx)
         nx_prev = nx
 
-        # 1. Find new wave candidate (greedy step)
+        # 1. Find new wave candidate (greedy step)   -- O(5ms) for 100 Sobol pts.
         nx = find_next_wave!(x, nx, reg, os)
-        f_guess *= f_shrink
         #### DEBUG
         println("Iteration $iter: new x start \n", x[1:nx])
 
-        # 2. Cheap gatekeeper: Calculate approximate, unsharpened SSE
-        err_approx = cost(x, nx, 0.0, os)
-
-        # Drop out immediately if the greedy placement didn't even dent the residual.
-        # Choose a conservative threshold (e.g., 0.999 means at least 0.1% improvement)
-        if err_approx > 0.999 * err_baseline
-            nx = nx_prev  # Roll back the candidate length
-            break
-        end
-
-        # 3. Expensive optimization step: Only run if the candidate passes the gatekeeper
+        # 2. Optimize over all parameters      -- O(2ms * (nw/4)^2)
         sharpen!(x, nx, reg, os)
 
-        # 4. True BIC: Evaluate the fully optimized joint model
+        # 2a. Basin-hopping: perturb solution, reoptimize, take a potential step
+        #     and either accept or reject. Repeat several times.
+        f0 = cost(x,nx,reg,os)
+        n_jumps = 10
+        for j = 1:n_jumps
+            f0 = test_jump!(x, nx, dx, f0, reg, os)
+        end
+        dx *= dx_shrink
+        
+        # 3. True BIC: Evaluate the fully optimized joint model
         err_sharpened = cost(x, nx, 0.0, os)
         BIC = nz2*log(err_sharpened / nz2) + nx*log(nz2)
 
         if BIC > BIC_prev
             @inbounds x[1:nx_prev] .= view(os.backup_buf, 1:nx_prev)
             nx = nx_prev
-            break
+            # Wave 1 is often 0 for complicated profiles
+            if iter > 1
+                break
+            end
         else
             BIC_prev = BIC
             nx_best = nx
