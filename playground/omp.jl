@@ -345,6 +345,99 @@ function sharpen!(x::Vector{Float64}, nx::Int64, reg::Float64, os::OMPStruct)
     return nothing
 end
 
+function fb_sharpen!(x::Vector{Float64}, nx::Int64, reg::Float64, os::OMPStruct)
+    # Forward-Backward step
+    # Start with two new waves, then remove each wave in turn (including previous waves)
+    # and keep best solution (ending at nw+1 waves)
+    nw = div(nx, 3)
+    nz2 = 2 * length(os.col.U)
+    sc = view(os.sc_buf, 1:nx)
+    lo = view(os.lo_buf, 1:nx)
+    up = view(os.up_buf, 1:nx)
+    xc = get_tmp(os.xcache, x)
+    
+    for i = 0:nw-1
+        idx = 3i
+        sc[idx+1], sc[idx+2], sc[idx+3] = π, 100.0, 1e-3
+        lo[idx+1], lo[idx+2], lo[idx+3] = -Inf, -150/sc[idx+2], 0.0
+        up[idx+1], up[idx+2], up[idx+3] = Inf, 150/sc[idx+2], Inf
+    end
+
+    # Rescale and transform x to solution space
+    for i = 0:nw-1
+        idx = 3i
+        x[idx+1] /= sc[idx+1]
+        x[idx+2] /= sc[idx+2]
+        x[idx+3] = sqrt(x[idx+3]/sc[idx+3])
+    end
+
+    fill!(xc,0)
+
+    ## We assume that any sharpening on the nx solution has already been done
+    ## Now we do only the sharpening on subproblems
+
+    # For reference: 
+    bic0 = Inf
+    bic1 = Inf
+
+    ## Declare optimization problem (unconstrained, solving for beta = sqrt(f0) such that beta^2 always >0)
+    x_out = zeros(Float64, nx-3)
+    td = let nx=nx-3, nw=nw-1, os=os, reg=reg   # looking at a problem with nw-1 waves
+        obj = x -> begin 
+            tmp = get_tmp(os.tmp_cache2, x)
+            # scale x back
+            for j = 0:nw-1
+                idx = 3j
+                tmp[idx+1] = sc[idx+1]*x[idx+1]
+                tmp[idx+2] = sc[idx+2]*x[idx+2]
+                tmp[idx+3] = sc[idx+3]*(x[idx+3]^2)
+            end
+            return cost(tmp, nx, reg, os)
+        end
+        TwiceDifferentiable(obj, x_out, autodiff=:forward)
+    end
+
+    ## Loop over waves, dropping one at a time and optimizing the remainder
+    options = Optim.Options()
+    for i = 0:nw-1
+        # copy the rest into x_out
+        for j = 1:3i
+            x_out[j] = x[j]
+        end
+        for j = 3i+4:nx
+            x_out[j-3] = x[j]
+        end
+
+        # Optimize
+        res = Optim.optimize(td, x_out, NewtonTrustRegion(), options)
+
+        # scale res.minimizer back
+        for j = 0:nw-2   # this array is only 3*(nw-1) long
+            idx = 3j
+            idx2 = 3*(j>i ? j-1 : j)
+            x_out[idx+1] = sc[idx2+1]*res.minimizer[idx+1]
+            x_out[idx+2] = sc[idx2+2]*res.minimizer[idx+2]
+            x_out[idx+3] = sc[idx2+3]*(res.minimizer[idx+3]^2)
+        end
+
+        # Test if BIC(res.minimizer) is lower than BIC(x_out)
+        bic1 = nz2*log(cost(x_out,nx-3,0.0,os) / nz2) + (nx-3)*log(nz2)
+        if bic1 < bic0
+            for j = 1:nx-3
+                xc[j] = x_out[j]
+            end
+            bic0 = bic1
+        end
+    end
+
+    ## Store the best solution (we already rescaled)
+    nx = nx-3
+    for j = 1:nx
+        x[j] = xc[j]
+    end
+    return nx
+end
+
 function test_jump!(x::Vector{Float64}, nx::Int64, dx::Float64, f0::Float64, reg::Float64, os::OMPStruct)
     ### Randomly perturb, sharpen, accept/reject based on relative quality
     ### x, nx -- solution so far
