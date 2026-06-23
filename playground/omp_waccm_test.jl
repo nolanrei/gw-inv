@@ -64,8 +64,7 @@ nx = 0
 kw = 2pi/5e4
 src = 1
 wav = c_to_wave(0.0, [1.0; 0.0], kw, 0.0, src)
-os = OMPStruct(col, L81_AD_wrapper!, wav; max_nw=max_nw)
-os.fluxvec = fluxvec
+os = OMPStruct(col, L81_AD_wrapper!, wav; max_nw, fluxvec)
 #=
 #############################################################################################
 ## Special Testing Code -- launch two known half-breaking waves in a known sideswipe profile
@@ -94,13 +93,18 @@ os.fluxvec .= clean_signal .+ (sigma .* err)
 ## Reconstruct
 reg = 1e-8
 #nx = find_measure!(x,reg,os)
-
+ws = FullHessianOMPWorkspace(nz, max_nw)
+fgh_closure = make_full_hessian_fgh(os, ws, reg, os.sc)
 
 # Keep track of our guess for max remaining wave flux
 f_guess = 0.25e-3
 f_shrink = 0.5
+
+nwnew=2
+nxnew=3*nwnew
 for iter = 1:5
-    global nx = find_next_wave!(x, nx, reg, os)
+    global nx = find_next_wave!(x, nx, reg, os; nwnew=2, max_f_calls=10000, pop_size=50, stride=2)
+    #nx = find_next_wave!(x, nx, reg, os; nwnew=1,max_f_calls=50000, pop_size=30)
     #### DEBUG
     println("New x start \n", x[1:nx])
     
@@ -109,8 +113,8 @@ for iter = 1:5
     res = get_tmp(os.res,1.0)  # give me the float
     # somewhat hackily get forward propagated vec from recon = res - os.fluxvec
     recon = os.fluxvec .- res
-    plot(reshape(os.fluxvec,(nz,2)),z,xlabel=["X recon (Pa)" "Y recon (Pa)"],ylabel="z (km)",label="flux",layout=2)
-    plot!(reshape(recon,(nz,2)),z,label="recon")
+    plot(1e3*reshape(os.fluxvec,(nz,2)),z,xlabel=["X recon (mPa)" "Y recon (mPa)"],ylabel="z (km)",label="flux",layout=2)
+    plot!(1e3*reshape(recon,(nz,2)),z,label="recon")
     savefig("recon$(iter)_t.png")
 
     #plot score landscape
@@ -134,27 +138,28 @@ p2 = heatmap(th_range, c_range, score',
              title="Score Heatmap (Top View)", color=:viridis)
              
 # Mark the found solution
-scatter!(p2, x[1:3:3*iter-5], x[2:3:3*iter-4], color=:black, label="previous waves", markersize=5)
-scatter!(p2, [x[3*iter-2]], [x[3*iter-1]], color=:white, label="found wave", markersize=5)
+scatter!(p2, x[1:3:nx-nxnew], x[2:3:nx-nxnew], color=:black, label="previous waves", markersize=5)
+scatter!(p2, x[nx-nxnew+1:3:nx], x[nx-nxnew+2:3:nx], color=:white, label="found wave", markersize=5)
 
 plot(p1, p2, layout=(1,2), size=(900, 400))
 savefig("diagnostic_plot$(iter).png")
 
     # Update max wave flux guess
     global f_guess *= f_shrink
-    # 3. Expensive optimization step: Only run if the candidate passes the gatekeeper
-    sharpen!(x, nx, reg, os)
-
+    
+    # forward-backward sharpen
+    nx = fb_sharpen_adaptive!(x, nx, os, fgh_closure; reltol=0.0)
+    
     # plot it again after sharpening
     get_res!(x,nx,os)
     res = get_tmp(os.res,1.0)  # give me the float
     # somewhat hackily get forward propagated vec from recon = res - os.fluxvec
     recon = os.fluxvec .- res
-    plot(reshape(os.fluxvec,(nz,2)),z,xlabel=["X recon (Pa)" "Y recon (Pa)"],ylabel="z (km)",label="flux",layout=2)
-    plot!(reshape(recon,(nz,2)),z,label="recon")
+    plot(1e3*reshape(os.fluxvec,(nz,2)),z,xlabel=["X recon (mPa)" "Y recon (mPa)"],ylabel="z (km)",label="flux",layout=2)
+    plot!(1e3*reshape(recon,(nz,2)),z,label="recon")
     savefig("recon$(iter)_s.png")
 
-    scatter(x[1:3:3*iter-2], x[2:3:3*iter-1], color=:black, label="sharpened soln", markersize=5)
+    scatter(x[1:3:nx-2], x[2:3:nx-1], color=:black, label="sharpened soln", markersize=5)
     savefig("spectrum$(iter).png")
 end
 
