@@ -61,7 +61,7 @@ max_nw = 20
 x = zeros(3*max_nw)
 nx = 0
 
-kw = 2pi/5e4
+kw = 2pi/5e3
 src = 1
 wav = c_to_wave(0.0, [1.0; 0.0], kw, 0.0, src)
 os = OMPStruct(col, L81_AD_wrapper!, wav; max_nw, fluxvec)
@@ -159,7 +159,8 @@ savefig("diagnostic_plot$(iter).png")
     plot!(1e3*reshape(recon,(nz,2)),z,label="recon")
     savefig("recon$(iter)_s.png")
 
-    scatter(x[1:3:nx-2], x[2:3:nx-1], color=:black, label="sharpened soln", markersize=5)
+    scatter(x[1:3:nx-2], x[2:3:nx-1], xlims=[0.0,2pi],ylims=[0.0,100.0], zcolor=x[3:3:nx],
+        label="sharpened soln", markersize=5)
     savefig("spectrum$(iter).png")
 end
 

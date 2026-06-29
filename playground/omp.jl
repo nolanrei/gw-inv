@@ -14,6 +14,8 @@ using BlackBoxOptim
 
 include(expanduser("~/work/gw-inv/L81-2.jl"))
 
+const MAX_C = 150.0
+
 # T is the element type of the residual, F is the function, C is the Cache type
 mutable struct OMPStruct{T, F, C}
     col         :: ColumnProfile
@@ -277,7 +279,7 @@ function y_to_x!(x, y, sc, nw; iw_start=0)
     return nothing
 end
 
-function fb_sharpen_adaptive!(x::AbstractVector, nx::Int64, os::OMPStruct, fgh_closure; reltol::Float64=0.01)
+function fb_sharpen_adaptive!(x::AbstractVector, nx::Int64, os::OMPStruct, fgh_closure; reltol::Float64=0.01, verbose=false)
     # Forward-Backward step
     # Start with a solution then remove each wave in turn, getting rid of the ones
     # that don't sufficiently improve the solution
@@ -295,14 +297,16 @@ function fb_sharpen_adaptive!(x::AbstractVector, nx::Int64, os::OMPStruct, fgh_c
 
     options = Optim.Options(iterations=50)
 
-    #=
+    
     lenx = length(x)
     resize!(x,nx)
     res = Optim.optimize(Optim.only_fgh!(fgh_closure), x, NewtonTrustRegion(), options)
-    println(res.minimizer)
+    if verbose
+        println(res.minimizer)
+    end
     x[1:nx] .= res.minimizer
     resize!(x,lenx)
-    =#
+    
     
     keep_dropping = true
 
@@ -331,8 +335,10 @@ function fb_sharpen_adaptive!(x::AbstractVector, nx::Int64, os::OMPStruct, fgh_c
         
         # Evaluate BIC / pruning condition...
         bic_xbest = evaluate_bic(os.xbest, target_dim, os)
-        println("Trial x: ", os.xbest[1:target_dim])
-        println(bic_xbest,"\t",bic_x)
+        if verbose
+            println("Trial x: ", os.xbest[1:target_dim])
+            println(bic_xbest,"\t",bic_x)
+        end
         
         if bic_xbest <= bic_x*(1-reltol)
             x_to_y!(x, view(os.xbest, 1:target_dim), sc, nw-1)
@@ -341,9 +347,20 @@ function fb_sharpen_adaptive!(x::AbstractVector, nx::Int64, os::OMPStruct, fgh_c
             bic_x = bic_xbest
         else
             keep_dropping = false
-            y_to_x!(x,x,sc,nw)
         end
     end
+    y_to_x!(x,x,sc,nw)
+
+    # Map th and c onto [0, 2pi) and [0.0, MAX_C]
+    for i = 0:nw-1
+        if x[3i+2] < 0
+            x[3i+2] *= -1
+            x[3i+1] += pi
+        end
+        x[3i+1] = mod(x[3i+1], 2pi)
+        x[3i+2] = min(x[3i+2], MAX_C)
+    end
+    
     resize!(os.xcopy,xcopy_init_len)
     return nx
 end
@@ -372,7 +389,7 @@ function find_measure!(x::Vector{Float64}, reg::Float64, os::OMPStruct, ws::Unio
         # 1. Find new wave candidate (greedy step)   -- O(50ms)
         nx = find_next_wave!(x, nx, reg, os; nwnew=2, max_f_calls=10000, pop_size=50, stride=2)
         #### DEBUG
-        println("Iteration $iter: new x start \n", x[1:nx])
+        #println("Iteration $iter: new x start \n", x[1:nx])
 
         # 2. Optimize over all parameters      -- O(1ms * (nw/4)^2 * nw)
         nx = fb_sharpen_adaptive!(x, nx, os, fgh_closure)
