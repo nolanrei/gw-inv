@@ -90,6 +90,27 @@ function OMPStruct(col, prop_AD!::F, wav; max_nw=20, fluxvec=nothing) where F
         backup_buf, sc, lo, up, max_nw)
 end
 
+function fwd!(out::AbstractVector, x::AbstractVector, nx::Int64, os::OMPStruct; ksig::Float64=os.ksig)
+    nz = length(os.col.U)
+    tmp = get_tmp(os.res_cache, x)
+    
+    fill!(out, 0)
+    nw = div(nx, 3)
+    for i = 1:nw
+        # Non-allocating view for parameters
+        p_i = view(x, (3*(i-1)+1):(3*i))
+        
+        # propagate wave i
+        fill!(tmp, 0)
+        os.prop_AD!(tmp, p_i, os.wav, os.col; ksig)
+        
+        @inbounds for j = 1:2nz
+            out[j] += tmp[j]
+        end
+    end
+    return nothing
+end
+
 function get_res!(x::AbstractVector, nx::Int64, os::OMPStruct; ksig::Float64=os.ksig)
     nz = length(os.col.U)
     tmp = get_tmp(os.res_cache, x) 
@@ -120,8 +141,9 @@ function cost(x::AbstractVector, nx::Int64, reg::Float64, os::OMPStruct)
 
     res = get_tmp(os.res, x)
     
-    for i = 1:2nz
+    for i = os.wav.src:nz
         out += res[i]^2
+        out += res[i+nz]^2
     end
     out *= 0.5
     for i = 3:3:nx
@@ -232,7 +254,7 @@ function find_next_wave!(x::AbstractVector, nx::Int64, reg::Float64, os::OMPStru
     # SearchRange=(0.0, 1.0) corresponds to [(0,2pi), (0,100), (0,4e-3)]
     result = bboptimize(resnorm, SearchRange=(0.0, 1.0), NumDimensions=nxnew,
         Method=:adaptive_de_rand_1_bin, MaxFuncEvals=max_f_calls, 
-        PopulationSize=pop_size, initial_x=guess_x)
+        PopulationSize=pop_size, initial_x=guess_x, TraceMode = :silent)
 
     y_to_x!(view(x,nx+1:nx+nxnew), best_candidate(result), sc, nwnew)
     nx += nxnew
@@ -251,10 +273,23 @@ function pack_surviving_parameters!(dest::AbstractVector, source::AbstractVector
     end
 end
 
-function evaluate_bic(x::AbstractVector, nx::Int64, os::OMPStruct)
+struct BICOptions
+    min_improvement::Float64      # for sharpen!, how much flat improvement we need to accept new solution
+    complexity_weight::Float64    # 1.0 is standard BIC, </> puts more/less emphasis on fit quality
+    noise_variance::Float64       # expected variance of additive flux noise
+end
+
+BICOptions(;
+    min_improvement=0.0,
+    complexity_weight=1.0,
+    noise_variance=0.0,
+) = BICOptions(min_improvement, complexity_weight, noise_variance)
+
+function evaluate_bic(x::AbstractVector, nx::Int64, os::OMPStruct, opts::BICOptions)
     nz2 = 2 * length(os.col.U)
-    err_sharpened = cost(x, nx, 0.0, os)
-    BIC = nz2*log(err_sharpened / nz2) + nx*log(nz2)
+    err = cost(x, nx, 0.0, os)
+    BIC = nz2*log(err / nz2 + opts.noise_variance) + 
+            opts.complexity_weight*nx*log(nz2)
 end
 
 function x_to_y!(y, x, sc, nw; iw_start=0)
@@ -279,7 +314,8 @@ function y_to_x!(x, y, sc, nw; iw_start=0)
     return nothing
 end
 
-function fb_sharpen_adaptive!(x::AbstractVector, nx::Int64, os::OMPStruct, fgh_closure; reltol::Float64=0.01, verbose=false)
+function fb_sharpen_adaptive!(x::AbstractVector, nx::Int64, os::OMPStruct, 
+        bic_opts::BICOptions, fgh_closure; verbose=false, fast=false)
     # Forward-Backward step
     # Start with a solution then remove each wave in turn, getting rid of the ones
     # that don't sufficiently improve the solution
@@ -291,11 +327,12 @@ function fb_sharpen_adaptive!(x::AbstractVector, nx::Int64, os::OMPStruct, fgh_c
     lo = os.lo
     up = os.up
 
-    bic_x = evaluate_bic(x,nx,os)
+    noise = 1e-7
+    bic_x = evaluate_bic(x,nx,os, bic_opts)
 
     x_to_y!(x, x, sc, nw)
 
-    options = Optim.Options(iterations=50)
+    options = Optim.Options(iterations=50)  #, show_trace=true
 
     
     lenx = length(x)
@@ -321,26 +358,53 @@ function fb_sharpen_adaptive!(x::AbstractVector, nx::Int64, os::OMPStruct, fgh_c
         for drop_idx = 0:nw-1
             # Pack all waves except the dropped one into a pre-allocated buffer
             pack_surviving_parameters!(os.xcopy, x, nw, drop_idx)
-            
-            res = Optim.optimize(Optim.only_fgh!(fgh_closure), os.xcopy, 
-                                    NewtonTrustRegion(), options)
-            
-            score = Optim.minimum(res)
+
+            if fast
+                score = cost(os.xcopy, target_dim, 1e-8, os)  # Not too happy about this but we don't have reg
+            else
+                res = Optim.optimize(Optim.only_fgh!(fgh_closure), os.xcopy, 
+                                        NewtonTrustRegion(), options)
+                score = Optim.minimum(res)
+            end
+
+            if verbose
+                y_to_x!(os.xcopy, os.xcopy, sc, nw-1)
+                println("Best sol dropping wave $drop_idx: ", os.xcopy)
+                x_to_y!(os.xcopy, os.xcopy, sc, nw-1)
+                println("score: $score")
+            end
+
+            # Drop each wave, re-evaluate how good solution is
+            # Choose wave to drop by which solution was the best
             if score < best_drop_score
                 best_drop_score = score
-                # scale res.minimizer back
-                y_to_x!(os.xbest, res.minimizer, sc, nw-1)
+                # keep track of best wave to drop
+                if fast
+                    # fast optimizes later so we don't want to rescale
+                    os.xbest[1:target_dim] .= os.xcopy
+                else
+                    # slow can scale back
+                    y_to_x!(os.xbest, res.minimizer, sc, nw-1)
+                end
             end
+        end
+
+        if fast
+            # Fast optimizes once after dropping a wave
+            res = Optim.optimize(Optim.only_fgh!(fgh_closure), os.xbest, 
+                                NewtonTrustRegion(), options)
+            # now we scale back
+            y_to_x!(os.xbest, res.minimizer, sc, nw-1)
         end
         
         # Evaluate BIC / pruning condition...
-        bic_xbest = evaluate_bic(os.xbest, target_dim, os)
+        bic_xbest = evaluate_bic(os.xbest, target_dim, os, bic_opts)
         if verbose
             println("Trial x: ", os.xbest[1:target_dim])
             println(bic_xbest,"\t",bic_x)
         end
         
-        if bic_xbest <= bic_x*(1-reltol)
+        if bic_xbest <= bic_x - bic_opts.min_improvement
             x_to_y!(x, view(os.xbest, 1:target_dim), sc, nw-1)
             nx = target_dim
             nw -= 1
@@ -365,13 +429,15 @@ function fb_sharpen_adaptive!(x::AbstractVector, nx::Int64, os::OMPStruct, fgh_c
     return nx
 end
 
-function find_measure!(x::Vector{Float64}, reg::Float64, os::OMPStruct, ws::Union{FullHessianOMPWorkspace,Nothing})
+function find_measure!(x::Vector{Float64}, reg::Float64, os::OMPStruct, 
+        ws::Union{FullHessianOMPWorkspace,Nothing}, bic_opts::BICOptions;
+    fast_sharpen=true)
     nz = length(os.col.U)
     nz2 = 2 * nz
     nx = 0  
     fill!(x, 0.0)
 
-    MAXITER = os.maxwaves
+    max_nx = 3*os.maxwaves
     BIC_prev = evaluate_bic(x, nx, os)
     nx_best = 0 
 
@@ -381,22 +447,25 @@ function find_measure!(x::Vector{Float64}, reg::Float64, os::OMPStruct, ws::Unio
 
     fgh_closure = make_full_hessian_fgh(os, ws, reg, os.sc)
 
-    for iter = 1:MAXITER
+    nwnew = 2
+    while nx + 3*nwnew <= max_nx
         # Back up state
         @inbounds os.backup_buf[1:nx] .= view(x, 1:nx)
         nx_prev = nx
 
         # 1. Find new wave candidate (greedy step)   -- O(50ms)
-        nx = find_next_wave!(x, nx, reg, os; nwnew=2, max_f_calls=10000, pop_size=50, stride=2)
+        nx = find_next_wave!(x, nx, reg, os; nwnew, max_f_calls=10000, pop_size=50, stride=2)
         #### DEBUG
-        #println("Iteration $iter: new x start \n", x[1:nx])
+        #println("find_measure!: new x start, nx=$nx \n", x[1:nx])
 
         # 2. Optimize over all parameters      -- O(1ms * (nw/4)^2 * nw)
-        nx = fb_sharpen_adaptive!(x, nx, os, fgh_closure)
+        nx = fb_sharpen_adaptive!(x, nx, os, bic_opts, fgh_closure; reltol=0.0, fast=fast_sharpen)
+
+        #println("find_measure!: post-sharpen, nx=$nx \n", x[1:nx])
 
         # termination criterion -- BIC isn't decreasing any more
-        BIC = evaluate_bic(x, nx, os)
-        if BIC >= BIC_prev
+        BIC = evaluate_bic(x, nx, os, bic_opts)
+        if BIC >= BIC_prev - bic_opts.min_improvement
             @inbounds for i = 1:nx_prev
                 x[i] = os.backup_buf[i]
             end
@@ -407,12 +476,13 @@ function find_measure!(x::Vector{Float64}, reg::Float64, os::OMPStruct, ws::Unio
             nx_prev = nx
         end
     end
+    #println("find_measure!: post-termination, nx=$nx \n", x[1:nx])
 
     if nx < length(x)
-        @inbounds fill!(view(x, (nx_best + 1):length(x)), 0.0)
+        @inbounds fill!(view(x, (nx + 1):length(x)), 0.0)
     end
 
-    return nx_best
+    return nx
 end
 
 function get_score(params::AbstractVector, f_guess::Float64, os::OMPStruct)
@@ -578,7 +648,9 @@ end
 
 function L81_AD_wrapper!(flux_out::AbstractVector, wave_params::AbstractVector, 
                          wav::WaveProfile, col::ColumnProfile; 
-                         ksig::Float64=20.0, stride::Int64=1)
+                         ksig::Float64=20.0, stride::Int64=1,
+                         mom_leak=false
+    )
     # Computes L81(flux*wave) and d/dflux L81(flux*wave)
     # Reformats inputs so automatic differentiation can do its thing
 
@@ -600,7 +672,7 @@ function L81_AD_wrapper!(flux_out::AbstractVector, wave_params::AbstractVector,
     cdir_1, cdir_2 = cos(th), sin(th)            # direction of wave propagation
     vb = col.U[wav.src]*cdir_1 + col.V[wav.src]*cdir_2        # mean flow speed in direction of wave at src
     momsign = sign(c-vb)         # flux has to be in direction c-v_src
-    bb = col.rho[wav.src]*0.5*absk*(c-vb)^3/col.N[wav.src]
+    bb = col.rho[wav.src]*0.5*absk*(c-vb)^3/(col.N[wav.src] + tiny)
     sb = sign(c-vb)
 
     bmin = T(Inf)
@@ -614,7 +686,7 @@ function L81_AD_wrapper!(flux_out::AbstractVector, wave_params::AbstractVector,
             # Look ahead by stride, capping at the top of the atmosphere
             next_lvl = min(lvl + stride, col.nlev)
             vt = col.U[next_lvl]*cdir_1 + col.V[next_lvl]*cdir_2       # flow speed at top of coarse cell
-            bt = col.rho[next_lvl] * 0.5*absk*(c-vt)^3/col.N[next_lvl]   # breaking condition
+            bt = col.rho[next_lvl] * 0.5*absk*(c-vt)^3/(col.N[next_lvl] + tiny)   # breaking condition
         end
 
         # Compute b(z) instead of b-tilde(z)
@@ -641,6 +713,90 @@ function L81_AD_wrapper!(flux_out::AbstractVector, wave_params::AbstractVector,
         flux = (1-th_eff)*bb + th_eff*flux  
         
         # we assume that momentum gets deposited in the direction of phase speed
+        if mom_leak
+            # Setting mimicking WACCM which will give flux the wrong sign on the last 
+            # cell about half the time
+            momsign = sign(c - 0.5*(vb+vt))  # WACCM does midpoint; this is close enough
+        end
+        flux_out[lvl] = momsign*flux*cdir_1                    # zonal
+        flux_out[lvl+col.nlev] = momsign*flux*cdir_2           # meridional (all the ys at the end)
+        
+        vb = vt
+        bb = bt
+    end
+end
+
+# copying the whole thing to make it easier to dispatch into WACCM runs
+function L81_AD_wrapper_leak!(flux_out::AbstractVector, wave_params::AbstractVector, 
+                         wav::WaveProfile, col::ColumnProfile; 
+                         ksig::Float64=20.0, stride::Int64=1
+    )
+    # Computes L81(flux*wave) and d/dflux L81(flux*wave)
+    # Reformats inputs so automatic differentiation can do its thing
+
+    # Get the underlying type (will be Float64 normally, or Dual during AD)
+    T = eltype(wave_params)
+
+    th = wave_params[1]
+    c = wave_params[2]
+    flux = wave_params[3]
+
+    # softening the discontinuities in the gradient by replacing
+    # if statements with sigmoids
+    tiny = T(1e-15)  # for scaling
+
+    nz = length(col.U)
+
+    # We keep wav around for the wave parameters that we usually hold constant (absk, src)
+    absk = hypot(wav.k, wav.l)
+    cdir_1, cdir_2 = cos(th), sin(th)            # direction of wave propagation
+    vb = col.U[wav.src]*cdir_1 + col.V[wav.src]*cdir_2        # mean flow speed in direction of wave at src
+    momsign = sign(c-vb)         # flux has to be in direction c-v_src
+    bb = col.rho[wav.src]*0.5*absk*(c-vb)^3/(col.N[wav.src] + tiny)
+    sb = sign(c-vb)
+
+    bmin = T(Inf)
+    
+    # Loop from bottom to top of column, jumping by stride
+    for lvl = wav.src:stride:col.nlev        
+        if lvl == col.nlev
+            vt = vb
+            bt = bb
+        else
+            # Look ahead by stride, capping at the top of the atmosphere
+            next_lvl = min(lvl + stride, col.nlev)
+            vt = col.U[next_lvl]*cdir_1 + col.V[next_lvl]*cdir_2       # flow speed at top of coarse cell
+            bt = col.rho[next_lvl] * 0.5*absk*(c-vt)^3/(col.N[next_lvl] + tiny)   # breaking condition
+        end
+
+        # Compute b(z) instead of b-tilde(z)
+        if abs(bb) < bmin
+            bmin = abs(bb)
+        else
+            bb = sign(bb)*bmin
+        end
+        
+        # If c-v at bottom and top of cell have different signs, there's a 
+        # critical layer somewhere in here and we need to break and dump all momentum
+        vscale = 0.4  # should scale things such that 1m/s difference is tanh(2.5) = 0.986 
+        sig_crit = 0.5*(1 + tanh(sb*(c-vt)/vscale))
+        bb *= sig_crit
+        bt *= sig_crit
+        
+        # sigmoid replaces "if abs(flux) > abs(bb)"
+        sgnfl = sign(flux)
+        bb = sgnfl*abs(bb)        # we need it to match the sign on flux
+        diff = ( abs(flux) - abs(bb) )/(abs(bb) + tiny)
+        s = 0.5*(1 + tanh(ksig * diff))  # if flux > bb, s will go to 1
+        th_eff = (1-s)     # for flux << bb, th_eff = 1; for flux >> bb, th_eff = 0
+        fi = flux
+        flux = (1-th_eff)*bb + th_eff*flux  
+        
+        # we assume that momentum gets deposited in the direction of phase speed
+        
+        # Setting mimicking WACCM which will give flux the wrong sign on the last 
+        # cell about half the time
+        momsign = sign(c - 0.5*(vb+vt))  # WACCM does midpoint; this is close enough
         flux_out[lvl] = momsign*flux*cdir_1                    # zonal
         flux_out[lvl+col.nlev] = momsign*flux*cdir_2           # meridional (all the ys at the end)
         

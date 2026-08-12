@@ -3,6 +3,8 @@ using SparseArrays
 using StaticArrays
 using IterativeSolvers
 using Lasso
+using Distributions
+using Random
 
 mutable struct WaveProfile
     k::Float64                  # x wavenumber
@@ -149,6 +151,20 @@ function make_stochastic_waveset(wavespds::Vector{Tv}, ndirs::Ti, srcs::Vector{T
     end
 
     return waves
+end
+
+function sample_gws!(x::Array{Float64}, nx::Integer, uvec::AbstractVector;
+        alpha=0.9, mn=20.0, beta=0.2, vm=2.0, cscale=4e-4, f0=1e-4)
+    nw = div(nx,3)
+    th0 = atan(uvec[2], uvec[1])
+    th = VonMises(th0, vm)
+    c = Gamma(alpha, mn/alpha)
+    f = Exponential(1.0)
+    for i = 1:nw
+        x[3i-2] = rand(th)
+        x[3i-1] = rand(c)#*(1+beta*cos(x[3i-2]-th0))
+        x[3i]   = f0*rand(f)/(1.0+cscale*x[3i-1]^2)
+    end
 end
 
 function append_col_to_spmat!(I::Vector{Ti}, 

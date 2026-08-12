@@ -1,4 +1,172 @@
 using NetCDF
+using Dates
+using DimensionalData
+using Statistics
+
+function rosette(x,nx)
+    nw = div(nx,3)
+    r = zeros(nw)
+    th = zeros(nw)
+    z = zeros(nw)
+    for i = 0:nw-1
+        th[i+1]  = x[3i+1]
+        r[i+1] = x[3i+2]
+        z[i+1]  = x[3i+3]
+    end
+    p = scatter(th, r, proj=:polar, marker_z=z)
+    return p
+end
+
+function rosette!(p, x, nx)
+    # can't be polar because it conflicts with things it could be plotted over
+    nw = div(nx, 3)
+    x_cart = zeros(nw)
+    y_cart = zeros(nw)
+    z = zeros(nw)
+    
+    for i = 0:nw-1
+        th = x[3i+1]
+        r  = x[3i+2]
+        z[i+1] = x[3i+3]
+        
+        x_cart[i+1] = r * cos(th)
+        y_cart[i+1] = r * sin(th)
+    end
+    
+    scatter!(p, x_cart, y_cart, marker_z=z, colorbar=false) 
+end
+
+function rosette_heatmap(x, nx; ep=0.3, n=200, cmax=nothing)
+    nw = div(nx, 3)
+
+    if isnothing(cmax)
+        cmax = maximum(x[2:3:nx-1])
+    end
+
+    # 1. Extract wave dot coordinates (Cartesian) and weights
+    dots = zeros(nw, 2)
+    weights = zeros(nw)
+    for i = 1:nw
+        th = x[3i-2]
+        c  = x[3i-1]
+        dots[i, 1] = c * cos(th)
+        dots[i, 2] = c * sin(th)
+        weights[i] = x[3i] # Wave weight/amplitude
+    end
+
+    # 2. Build 2D Cartesian grid spanning [-cmax, cmax]
+    grid_1d = range(-cmax, cmax, length=n)
+    map_2d = zeros(n, n)
+    ep2 = ep * ep
+
+    # 3. Evaluate RBF on Cartesian grid
+    for i in 1:n        # X index (columns)
+        x_val = grid_1d[i]
+        for j in 1:n    # Y index (rows)
+            y_val = grid_1d[j]
+            
+            # Mask out points outside the disk radius
+            if x_val^2 + y_val^2 > cmax^2
+                map_2d[j, i] = NaN
+                continue
+            end
+
+            # Accumulate RBF sum
+            val = 0.0
+            for k in 1:nw
+                dx = x_val - dots[k, 1]
+                dy = y_val - dots[k, 2]
+                r2 = dx*dx + dy*dy
+                val += weights[k] * exp(-ep2 * r2)
+            end
+            map_2d[j, i] = val
+        end
+    end
+
+    # 4. Plot Cartesian heatmap bounded into a clean circle
+    p = heatmap(grid_1d, grid_1d, map_2d, 
+                aspect_ratio = :equal, 
+                color = :viridis, 
+                xlims = (-cmax*1.05, cmax*1.05), 
+                ylims = (-cmax*1.05, cmax*1.05))
+
+    return p
+end
+
+function gaussian_rbf(xx,x,y,ep)
+    nxx = size(xx,1)
+    ny  = length(y)   # x and y should be the same length
+    ep2 = ep*ep
+
+    out = zeros(nxx)
+    
+    for i = 1:nxx
+        xxi = selectdim(xx,1,i)
+        for j = 1:ny
+            xj = selectdim(x,1,j)
+            r2 = sum(abs2, xxi.-xj)
+            out[i] += y[j]*exp(-ep2*r2)
+        end
+    end
+    return out
+end
+
+function flatten_ragged(xs)
+    # turn a ragged array into a flat array and an array of offsets
+    offsets = [0; cumsum(length.(xs))]
+    data = reduce(vcat, xs; init=eltype(first(xs))[])
+    return data, offsets
+end
+
+function unflatten_ragged(data, offsets)
+    [
+        data[offsets[i]+1 : offsets[i+1]]
+        for i in 1:length(offsets)-1
+    ]
+end
+
+function src_check(x,nx,fluxvec,U,V,iz; thresh=12.0, cutoff_ang=pi/6)
+    # Hypothesis: waves with direction dir are launched
+    # from levels with mean windspeed in direction dir
+    # For each wave in x, check if there is launch level below tropopause
+    # (maybe this should be below breaking level instead but that's harder)
+    nw = div(nx,3)
+    nz = length(U)
+    
+    wavdir = zeros(2)
+    srcs = zeros(nw)    # source heights in km. Must be less than thresh
+    prox = zeros(nw)    # proximity -- cos(angular difference)
+    
+    dirs = cat(U,V,dims=2)
+    dirs = dirs ./ sqrt.(sum(abs2,dirs,dims=2))   # unit direction vectors
+
+    good_enough = cos(cutoff_ang)  # gotta be within e.g. 30 degrees of wave to accept launch level
+    for i = 1:nw
+        th = x[3i-2]
+        wavdir[1] = cos(th); wavdir[2] = sin(th)
+
+        # find the best match (allow + and - matches since we think that's possible)
+        best = 0.0
+        zbest = 0.0
+        for j = 1:nz
+            if iz[j] > thresh
+                break
+            end
+            proj = abs(dot(wavdir, dirs[j,:]))   # + and -
+            if proj > best
+                best = proj
+                zbest = iz[j]
+            end
+        end
+        if best > good_enough
+            srcs[i] = zbest
+        else
+            srcs[i] = NaN
+        end
+        prox[i] = best
+    end
+    return srcs, prox
+end
 
 function conv(arr, filt; dim=1)
     # in the case of a 2+ dimensional input, dim specifies which
@@ -257,217 +425,211 @@ function bsrch(x::Real, a::AbstractArray{<:Real})
     return lo
 end
 
-function wrf_get_fileset(cases::Array{<:Integer})
-    input_dir  = "/projects/rps/epg2/gerberlab/WRF/INPUT/input_1deg_case"
-    output_dir = "/projects/rps/epg2/gerberlab/WRF/OUTPUT/mf_case"
+"""
+    parse_wrf_metadata(filepath::String)
+
+Parses the date from the filename and identifies the case number.
+"""
+function parse_wrf_metadata(filepath::String)
+    # Match date format YYYY-MM-DD
+    date_match = match(r"(?<year>\d{4})-(?<month>\d{2})-(?<day>\d{2})\.nc", filepath)
+    base_date = DateTime(
+        parse(Int, date_match[:year]), 
+        parse(Int, date_match[:month]), 
+        parse(Int, date_match[:day])
+    )
     
-    ifiles = Dict("U"=>[], "V"=>[]) #, "Q"=>[])
-    ofiles = Dict("UW"=>[], "VW"=>[])
-    v2d = Dict("UW"=>"/uw/", "VW"=>"/vw/")
-    for ivar in keys(ifiles)
-        for case in cases
-            idir = input_dir*string(case)
-            append!(ifiles[ivar],text_filter(r"\d{4}-\d{2}-\d{2}\Q.nc\E",readdir(idir,join=true)))
-        end
-    end
-
-    for ovar in keys(ofiles)
-        for case in cases
-            odir = output_dir*string(case)*v2d[ovar]*"sgs_rey"          # sgs_rey is the Reynolds fluxes; sgs_tau would be the uugs
-            append!(ofiles[ovar],text_filter(r"\d{4}-\d{2}-\d{2}\Q.nc\E",readdir(odir,join=true)))
-        end
-    end
-
-    return merge(ifiles, ofiles)
+    # Match case number from the folder path structure
+    case_match = match(r"case(?<case>\d+)", filepath)
+    case_num = parse(Int, case_match[:case])
+    
+    return base_date, case_num
 end
 
-function wrf_load(files::Dict{String,Vector{Any}})
-    # Need variables U, V, q, rho, N, Dx, Dy, lon, lat, z, t
-    # rho and N need to be falsified
-    # z and t need to be inferred from file structure
-    # Dx and Dy need to be calculated from UW and VW, resp.
-    # output in ncases x nlon x nlat x nz x nt form
+"""
+    get_wrf_files(case::Int)
 
-    # load in the "meat" of the data
-    v2k = Dict("U"=>"u1deg", "V"=>"v1deg", "UW"=>"rey_g", "VW"=>"rey_g") #"Q"=>"q1deg",
-    vars = Dict("U"=>[], "V"=>[], "UW"=>[], "VW"=>[]) #"Q"=>[],
-    dims = ("lon", "lat")
-    for var in keys(files)
-        nf = length(files[var])
-        vars[var] = Vector{Array{Float64,4}}(undef,nf)
-        key = v2k[var]
-        for idx = 1:nf
-            f = files[var][idx]
-            vars[var][idx] = ncread(f,key)
-        end
-    end
-
-    # Supply z -- all input files share one z scheme, and so do all output files
-    vars["iz"] = 1:65
-    vars["oz"] = 10:0.5:65
-    vars["oz_dx"] = 10.25:0.5:64.75     # originally 10:0.5:65 but then we're averaging it for DX and DY
-
-    # Supply rho and N
-    vars["N"] = ncread("/scratch/nr2489/work/loose_spectra/waccm_rho_and_N.nc","N")
-    vars["rho"] = ncread("/scratch/nr2489/work/loose_spectra/waccm_rho_and_N.nc","rho")
-    nzl = length(vars["rho"])
-    nzs = nzl - 1
-    rho = zeros(1,1,nzl,1)
-    rho[1,1,:,1] .= vars["rho"]
-    rhoi = zeros(1,1,nzs,1)
-    rhoi[1,1,:,1] .= 0.5*(rho[1,1,2:end,1] .+ rho[1,1,1:end-1,1])
-
-    # Calculate DX and DY
-    nX = length(vars["UW"])
-    nY = length(vars["VW"])
-    vars["DX"] = Vector{Array{Float64,4}}(undef,nX)
-    vars["DY"] = Vector{Array{Float64,4}}(undef,nY)
-    for idx = 1:nX
-        fv = vars["UW"][idx].*rho
-        vars["DX"][idx] = (fv[:,:,2:end,:].-fv[:,:,1:end-1,:])/(500)    # d/dz(uw), divided by dz = 500m
-        vars["DX"][idx] ./= rhoi
-    end
-    for idx = 1:nY
-        fv = vars["VW"][idx].*rho
-        vars["DY"][idx] = (fv[:,:,2:end,:].-fv[:,:,1:end-1,:])/(500)    # d/dz(vw), divided by dz = 500m
-        vars["DY"][idx] ./= rhoi
-    end
-
-    # Supply t -- julian date
-    vars["t"] = Vector{Array{Float64,1}}(undef,nX)
-    for idx = 1:nX
-        f = files["U"][idx]
-        vars["t"][idx] = ncread(f,"time")
-    end
-   
-    return vars
+Scans and sorts input/output files for a specific case number, respecting the directory hierarchy.
+"""
+function get_wrf_files(case::Int)
+    input_dir  = "/projects/rps/epg2/gerberlab/WRF/INPUT/input_1deg_case$(case)"
+    output_dir = "/projects/rps/epg2/gerberlab/WRF/OUTPUT/mf_case$(case)"
+    
+    # Gather and filter files matching the date regex
+    is_nc_file(f) = occursin(r"\d{4}-\d{2}-\d{2}\.nc$", f)
+    
+    u_files  = isdir(input_dir)  ? filter(is_nc_file, readdir(input_dir, join=true)) : String[]
+    uw_files = isdir(output_dir * "/uw/sgs_rey") ? filter(is_nc_file, readdir(output_dir * "/uw/sgs_rey", join=true)) : String[]
+    vw_files = isdir(output_dir * "/vw/sgs_rey") ? filter(is_nc_file, readdir(output_dir * "/vw/sgs_rey", join=true)) : String[]
+    
+    # Chronologically sort files using their filename metadata
+    sort_by_date(files) = sort(files, by = f -> parse_wrf_metadata(f)[1])
+    
+    return sort_by_date(u_files), sort_by_date(uw_files), sort_by_date(vw_files)
 end
 
-function wrf_postprocess!(vars::Dict)
-    # U and V are on the wrong grid. Interpolate them from the iz grid onto the oz grid
-    nU = length(vars["U"])
-    nV = length(vars["V"])
-    vars["Up"] = Vector{Array{Float64,4}}(undef,nU)
-    vars["Vp"] = Vector{Array{Float64,4}}(undef,nV)
-    zb = 10
-    ze = 65
-    noz = length(vars["oz"])
-    for idx = 1:nU
-        fv = vars["U"][idx]
-        nx,ny,nz,nt = size(fv)
-        tmp = zeros(nx,ny,noz,nt)
-        tmp[:,:,1:2:end,:] .= fv[:,:,zb:ze,:]  # "interpolate" onto integer mark
-        tmp[:,:,2:2:end,:] .= 0.5*fv[:,:,zb:ze-1,:]+0.5*fv[:,:,zb+1:ze,:]  # interpolate onto X.5 mark
-        #tmp[:,:,1:2:end,:] .= 0.75*fv[:,:,zb:ze-1,:]+0.25*fv[:,:,zb+1:ze,:]  # interpolate onto X.25 mark
-        #tmp[:,:,2:2:end,:] .= 0.25*fv[:,:,zb:ze-1,:]+0.75*fv[:,:,zb+1:ze,:]  # interpolate onto X.75 mark
-        vars["Up"][idx] = 0.0.+tmp     # 0.0.+tmp is supposed to make a copy
+"""
+    load_wrf_case(case::Int) -> DimStack
+
+Loads, interpolates, and stitches WRF files for a single case into a compatible DimStack.
+"""
+function load_wrf_case(case::Int)
+    u_files, uw_files, vw_files = get_wrf_files(case)
+    isempty(u_files) && error("No files found for WRF case $case")
+
+    # 1. Chronologically concatenate raw arrays
+    u_raw  = cat([ncread(f, "u1deg") for f in u_files]..., dims=4)
+    v_raw  = cat([ncread(f, "v1deg") for f in u_files]..., dims=4) # V resides in U files
+    uw_raw = cat([ncread(f, "rey_g") for f in uw_files]..., dims=4)
+    vw_raw = cat([ncread(f, "rey_g") for f in vw_files]..., dims=4)
+    
+    # 2. Build time axis
+    time_coords = DateTime[]
+    for f in u_files
+        base_date, _ = parse_wrf_metadata(f)
+        nt = size(ncread(f, "u1deg"), 4)
+        append!(time_coords, [base_date + Minute(15) * i for i in 0:(nt-1)])
     end
-    for idx = 1:nV
-        fv = vars["V"][idx]
-        nx,ny,nz,nt = size(fv)
-        tmp = zeros(nx,ny,noz,nt)
-        tmp[:,:,1:2:end,:] .= fv[:,:,zb:ze,:]  # "interpolate" onto integer mark
-        tmp[:,:,2:2:end,:] .= 0.5*fv[:,:,zb:ze-1,:]+0.5*fv[:,:,zb+1:ze,:]  # interpolate onto X.5 mark
-        #tmp[:,:,1:2:end,:] .= 0.75*fv[:,:,zb:ze-1,:]+0.25*fv[:,:,zb+1:ze,:]  # interpolate onto X.25 mark
-        #tmp[:,:,2:2:end,:] .= 0.25*fv[:,:,zb:ze-1,:]+0.75*fv[:,:,zb+1:ze,:]  # interpolate onto X.75 mark
-        vars["Vp"][idx] = 0.0.+tmp     # 0.0.+tmp is supposed to make a copy
-    end
-    return vars
+    
+    nx, ny, _, nt_total = size(u_raw)
+    
+    # Define vertical scales
+    iz    = 1.0:1.0:65.0
+    oz    = 10.0:0.5:65.0
+    oz_dx = 10.25:0.5:64.75
+    noz   = length(oz)
+    
+    # 3. Grid interpolation for U and V
+    zb, ze = 10, 65
+    Up = zeros(nx, ny, noz, nt_total)
+    Vp = zeros(nx, ny, noz, nt_total)
+    
+    Up[:, :, 1:2:end, :] .= u_raw[:, :, zb:ze, :]
+    Up[:, :, 2:2:end, :] .= 0.5 .* u_raw[:, :, zb:ze-1, :] .+ 0.5 .* u_raw[:, :, zb+1:ze, :]
+    
+    Vp[:, :, 1:2:end, :] .= v_raw[:, :, zb:ze, :]
+    Vp[:, :, 2:2:end, :] .= 0.5 .* v_raw[:, :, zb:ze-1, :] .+ 0.5 .* v_raw[:, :, zb+1:ze, :]
+    
+    # 4. Load average background profiles and process DX/DY
+    waccm_meta_path = "/scratch/nr2489/work/loose_spectra/waccm_rho_and_N.nc"
+    N_meta = ncread(waccm_meta_path, "N")
+    rho_meta = ncread(waccm_meta_path, "rho")
+    
+    rho_3d  = reshape(rho_meta, 1, 1, :, 1)
+    rhoi_3d = 0.5 .* (rho_3d[:, :, 2:end, :] .+ rho_3d[:, :, 1:end-1, :])
+    
+    fv_x = uw_raw .* rho_3d
+    DX   = (fv_x[:, :, 2:end, :] .- fv_x[:, :, 1:end-1, :]) ./ 500.0 ./ rhoi_3d
+    
+    fv_y = vw_raw .* rho_3d
+    DY   = (fv_y[:, :, 2:end, :] .- fv_y[:, :, 1:end-1, :]) ./ 500.0 ./ rhoi_3d
+    
+    # 5. Pack everything into standardized DimensionalData structures
+    # Retrieve lat/lon from the first u_file
+    lon_raw = ncread(u_files[1], "lon")
+    lat_raw = ncread(u_files[1], "lat")
+
+    # Define a flexible spatial_dims function that accepts the Z dimension as an argument
+    spatial_dims(Z_dim) = (X(1:nx), Y(1:ny), Z_dim, Ti(time_coords))
+
+    # Drop the redundant time dimension if it exists
+    lon_data = (ndims(lon_raw) == 3 ? lon_raw[:, :, 1] : lon_raw)
+    lat_data = (ndims(lat_raw) == 3 ? lat_raw[:, :, 1] : lat_raw)
+
+    # 4D Data (Raw, iZ axis, length 65)
+    da_Ur = DimArray(u_raw, spatial_dims(Dim{:Z_raw}(iz)); name=:U_raw)
+    da_Vr = DimArray(v_raw, spatial_dims(Dim{:Z_raw}(iz)); name=:V_raw)
+    
+    # 4D Data (Standard Z axis, length 111)
+    da_Up = DimArray(Up,    spatial_dims(Z(oz));    name=:U)
+    da_Vp = DimArray(Vp,    spatial_dims(Z(oz));    name=:V)
+    da_UW = DimArray(fv_x,  spatial_dims(Z(oz));    name=:UW)
+    da_VW = DimArray(fv_y,  spatial_dims(Z(oz));    name=:VW)
+    
+    # 4D Data (Staggered Z_dx axis, length 110)
+    da_DX = DimArray(DX,    spatial_dims(Dim{:Z_dx}(oz_dx)); name=:DX)
+    da_DY = DimArray(DY,    spatial_dims(Dim{:Z_dx}(oz_dx)); name=:DY)
+
+    # 1D/2D Metadata
+    lon_dims = ndims(lon_data) == 1 ? (X(1:nx),) : (X(1:nx), Y(1:ny))
+    lat_dims = ndims(lat_data) == 1 ? (Y(1:ny),) : (X(1:nx), Y(1:ny))
+    
+    da_lon = DimArray(lon_data, lon_dims; name=:lon)
+    da_lat = DimArray(lat_data, lat_dims; name=:lat)
+    
+    # Distinct dimensions for index-based and raw metadata profiles
+    da_iz  = DimArray(iz,       (Dim{:Z_iz}(1:65),); name=:iz)
+    da_oz  = DimArray(oz,       (Z(oz),);            name=:z)
+    da_rho = DimArray(rho_meta, (Dim{:Z_meta}(1:length(rho_meta)),); name=:rho)
+    da_N   = DimArray(N_meta,   (Dim{:Z_meta}(1:length(N_meta)),);   name=:N)
+    
+    return DimStack(da_Up, da_Vp, da_Ur, da_Vr, da_UW, da_VW, da_DX, da_DY, 
+                    da_lon, da_lat, da_iz, da_oz, da_rho, da_N; 
+                    metadata=Dict("case" => case, "source" => "WRF"))
 end
 
-function wrf_load_conv_indics!(vars, files)
+# One last DimStack function -- WRF has N/rho as single columns, WACCM has 4D arrays
+# This function lets you get your specific column if it exists, and otherwise the default one
+@inline function existing_selectors(A, xi, yi, ti)
+    selectors = ()
+    if hasdim(A, X)  selectors = (selectors..., X(xi)) end
+    if hasdim(A, Y)  selectors = (selectors..., Y(yi)) end
+    if hasdim(A, Ti) selectors = (selectors..., Ti(ti)) end
+    return selectors
+end
+
+function sample_existing_dims!(target_col::AbstractVector{Float64}, ds::DimStack, key, xi::Int, yi::Int, ti::Int)
+    A = ds[key]
+    selectors = existing_selectors(A, xi, yi, ti)
+    
+    if isempty(selectors)
+        target_col .= parent(A)
+    else
+        target_col .= vec(parent(view(A, selectors...)))
+    end
+end
+
+function mean_existing_dims(ds::DimStack, key, dims)
+    A = ds[key]
+    dims=()
+    if hasdim(A, X)  dims = (dims..., X) end
+    if hasdim(A, Y)  dims = (dims..., Y) end
+    if hasdim(A, Ti) dims = (dims..., Ti) end
+    if isempty(dims)
+        target_col = parent(A)
+    else
+        target_col = vec(parent(mean(A;dims)))
+    end
+    return target_col
+end
+
+function find_tropopause(N::Vector{T}, z::Vector{T}; 
+                                    z_min=5.0, threshold=0.016, persistence_km=2.0) where T<:AbstractFloat
     #=
-    Load in convection indicators (olr, precip) into vars
-    olr + precip are both in the inputs files, so files["U"] will find them
+        find_tropopause(N, z; z_min=5.0, threshold=0.016, persistence_km=2.0)
+    
+    Finds the first index where N exceeds a threshold and remains sustained 
+    above a buffer value for a given vertical thickness.
     =#
-    nf = length(files["U"])
-    vars["precip"] = Vector{Array{Float64,4}}(undef,nf)
-    vars["olr"] = Vector{Array{Float64,4}}(undef,nf)
-    for idx = 1:nf
-        f = files["U"][idx]
-        tmp = ncread(f,"precip")
-        sz = size(tmp)
-        vars["precip"][idx] = reshape(tmp, (sz[1], sz[2], 1, sz[3]))
-        tmp = ncread(f,"olr")
-        vars["olr"][idx] = reshape(tmp, (sz[1], sz[2], 1, sz[3]))
-    end
-end
-
-function wrf_tstamps_cases(files)
-    dates = []
-    cases = Set()
-    case_order = []
-    case_idxs = Dict()
-    idx2case = zeros(Int64,length(files))
-    for idx = 1:length(files)
-        f = files[idx]
-        regmatch = match(r"(?<year>\d{4})-(?<month>\d{2})-(?<day>\d{2})\Q.nc\E", f)
-        date = DateTime(parse(Int,regmatch[:year]), parse(Int,regmatch[:month]), parse(Int,regmatch[:day]))
-        push!(dates,date)
-
-        regmatch2 = match(r"\Qcase\E(?<case>\d+)", f)
-        case = parse(Int,regmatch2[:case])
-        if !(case in cases)
-            push!(cases, case)
-            push!(case_order,case)       # meant to keep the order of the cases identical to load order
-            case_idxs[case] = length(case_order)  # match the cases to their index in load order
-        end
-        idx2case[idx] = case_idxs[case]
-    end
-    return dates, idx2case, case_order
-end
-
-function wrf_order(tstamps, idx2case, case_order)
-    # Two stages -- sort files by case, and then within each case sort by time order
-    # First stage groups by case
-    nc = length(case_order)
-    idxs = [[] for ci = 1:nc]
-    for idx = 1:length(tstamps)
-        push!(idxs[idx2case[idx]],idx)
-    end
-    # And now sort by time within cases
-    for ci = 1:nc
-        sort!(idxs[ci])
-    end
-    return idxs
-end
-
-function wrf_knit(var, order)
-    # On loading in, all the variables are in [f1.var, f2.var, f3.var,...] format
-    # This function pieces together the different files in time order, 
-    # keeping different cases distinct
-    nc = length(order)
-    vark = Array{Array{Float64,4},1}(undef,nc)
-    for ci = 1:nc
-        nf = length(order[ci])
-        sz = collect(size(var[order[ci][1]]))     # size of all the files concatenated within this case
-        for i = 2:nf
-            sz[4] += size(var[order[ci][i]],4)    # add up time dimensions
-        end
-        vark[ci] = zeros(Float64,sz...)
-        ti = 1
-        for i = 1:nf
-            n4 = size(var[order[ci][i]],4)
-            vark[ci][:,:,:,ti:(ti+n4-1)] .= var[order[ci][i]]
-            ti += n4
+    start_search = searchsortedfirst(z, z_min)
+    baseline = 0.01
+    do_not_dip_below = 0.7*(threshold - baseline)
+    
+    for i in start_search:length(z)
+        if N[i] >= threshold
+            end_z = z[i] + persistence_km
+            end_idx = searchsortedlast(z, end_z)
+            
+            if end_idx > i
+                # Check if all points in the next 'persistence_km' stay above a buffer (e.g., 0.014)
+                # This protects against a minor oscillatory dip dropping back into tropospheric values
+                if all(@view(N[i:end_idx]) .>= do_not_dip_below)
+                    return i
+                end
+            end
         end
     end
-    return vark
-end
-
-function drag_means!(vars)
-    ncases = length(vars["DX"])
-    vars["means"] = Vector{Array{Float64,1}}(undef,ncases)
-    vars["std"] = Vector{Array{Float64,1}}(undef,ncases)
-    for idx = 1:ncases
-        mnx = dropdims(mean(vars["DX"][idx],dims=(1,2,4)),dims=(1,2,4))
-        mny = dropdims(mean(vars["DY"][idx],dims=(1,2,4)),dims=(1,2,4))
-        vars["means"][idx] = vcat(mnx,mny)
-        stdx = dropdims(std(vars["DX"][idx],dims=(1,2,4)),dims=(1,2,4))
-        stdy = dropdims(std(vars["DY"][idx],dims=(1,2,4)),dims=(1,2,4))
-        vars["std"][idx] = vcat(stdx,stdy)
-    end
-    return nothing
+    return -1 # Return -1 if no distinct tropopause is found
 end
 
 function cos_filter(nf::Number)

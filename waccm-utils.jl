@@ -2,129 +2,132 @@ using NetCDF
 using NCDatasets
 using Random
 using Dates
+using DimensionalData
 
-function load_waccm_data(start_idxs::Vector{Int64}, end_idxs::Vector{Int64}, verbose=false; wtype="OFC")
-    #=
-    Loads and computes WACCM data required for looking at gravity wave propagation and sources
-    Loads data between start_idxs and end_idxs, as in [start_idxs[1]:end_idxs[1], ..., start_idxs[end]:end_idxs[end]]
-    Indices should be in order [x, y, z, t]
-    Outputs:
-    - U (zonal mean-flow velocity)
-    - V (meridional mean-flow velocity)
-    - rho (density, has to be interpolated from cell edges)
-    - N (buoyancy frequency, has to be computed from derivative of potential temperature)
-    - lon (longitude)
-    - lat (latitude)
-    - Z (geopotential)
-    - ugw (total zonal GW momentum flux)
-    - vgw (total meridional GW momentum flux)
-    =#
+"""
+    load_waccm_stack(start_idxs::Vector{Int}, end_idxs::Vector{Int}; wtype="OFC") -> DimStack
+
+Loads raw subsets of WACCM data and maps them directly to a standardized DimStack.
+"""
+function load_waccm_stack(start_idxs::Vector{Int}, end_idxs::Vector{Int}; wtype="OFC")
     path_to_waccm = "/scratch/nr2489/waccm_1yr/"
-    f1 = "Input1_year1.nc"
-    f2 = "Input2_year1.nc"
-    f3 = "Input3_year1.nc"
-    f4 = "Input4_year1.nc"
-
-    ds1 = NCDataset(path_to_waccm*f1,"r")
-    ds2 = NCDataset(path_to_waccm*f2,"r")
-    ds3 = NCDataset(path_to_waccm*f3,"r")
-    ds4 = NCDataset(path_to_waccm*f4,"r")
-
-    lon = ds1["lon"]
-    lat = ds1["lat"]
-
+    
+    ds1 = NCDataset(joinpath(path_to_waccm, "Input1_year1.nc"), "r")
+    ds2 = NCDataset(joinpath(path_to_waccm, "Input2_year1.nc"), "r")
+    ds3 = NCDataset(joinpath(path_to_waccm, "Input3_year1.nc"), "r")
+    ds4 = NCDataset(joinpath(path_to_waccm, "Input4_year1.nc"), "r")
+    
+    lon_vals  = ds1["lon"][start_idxs[1]:end_idxs[1]]
+    lat_vals  = ds1["lat"][start_idxs[2]:end_idxs[2]]
+    time_vals = ds1["time"][start_idxs[4]:end_idxs[4]]
+    z_indices = start_idxs[3]:end_idxs[3] 
+    
     start_CI = CartesianIndex(start_idxs...)
     end_CI = CartesianIndex(end_idxs...)
-
-    # Z is nearly redundant data in the stratosphere -- average in lat/lon to save space?
-    Z = ds1["Z3"][start_CI:end_CI]
-    if verbose
-        println("longitude: $(lon[start_idxs[1]]) -- $(lon[end_idxs[1]]),\t latitude: $(lat[start_idxs[2]]) -- $(lat[end_idxs[2]])")
-    end
-
-    # gravity wave drags
-    ugw_oro = ds3["UTGWORO"][start_CI:end_CI]
-    ugw_frn = ds3["UTGWSPEC"][start_CI:end_CI]
-    ugw_con = ds4["BUTGWSPEC"][start_CI:end_CI]
-    vgw_oro = ds3["VTGWORO"][start_CI:end_CI]
-    vgw_frn = ds3["VTGWSPEC"][start_CI:end_CI]
-    vgw_con = ds4["BVTGWSPEC"][start_CI:end_CI]
-
-    # allows specifying
-    ugw = zeros(size(ugw_oro))
-    vgw = zeros(size(vgw_oro))
-    if !isnothing(match(r"O",wtype))
-        ugw .+= ugw_oro
-        vgw .+= vgw_oro
-    end
-    if !isnothing(match(r"F",wtype))
-        ugw .+= ugw_frn
-        vgw .+= vgw_frn
-    end
-    if !isnothing(match(r"C",wtype))
-        ugw .+= ugw_con
-        vgw .+= vgw_con
-    end
-
-    # Interpolating rho from cell faces to cell centers
-    # CAVEAT: to do the derivatives we need a few more points in Z than we're going to use
-    # so don't specify start_idxs and end_idxs such that z goes from 1 to end
-    # 2 to end-1 is the maximum safe range
-    e3 = CartesianIndex(0,0,1,0)
-    rhoi = ds2["RHOI"][(start_CI-e3):(end_CI+2*e3)]
-    rho = 0.5*(rhoi[:,:,1:end-1,:]+rhoi[:,:,2:end,:])
-    T = ds1["T"][(start_CI-e3):(end_CI+e3)]
-
-    # mean-flow velocities
+    e3 = CartesianIndex(0, 0, 1, 0)
+    
+    # Base variables
     U = ds1["U"][start_CI:end_CI]
     V = ds1["V"][start_CI:end_CI]
 
-#=    
-    # NetCDF package wants these intervals as (start, number of lines to read in this dimension)
-    count = 1 .+ end_idxs .- start_idxs
+    Z3 = ds1["Z3"][start_CI:end_CI]/1e3  # convert to km
     
-    lon = ncread(path_to_waccm*f1, "lon")
-    lat = ncread(path_to_waccm*f1, "lat")
-    # Z is nearly redundant data in the stratosphere -- average in lat/lon to save space?
-    Z = ncread(path_to_waccm*f1,"Z3", start_idxs, count)
-    if verbose
-        println("longitude: $(lon[start_idxs[1]]) -- $(lon[end_idxs[1]]),\t latitude: $(lat[start_idxs[2]]) -- $(lat[end_idxs[2]])")
-    end
-
-    # gravity wave drags
-    ugw = ncread(path_to_waccm*f3, "UTGWORO", start_idxs, count) +
-      ncread(path_to_waccm*f3, "UTGWSPEC", start_idxs, count) +
-      ncread(path_to_waccm*f4, "BUTGWSPEC", start_idxs, count)
-    vgw = ncread(path_to_waccm*f3, "VTGWORO", start_idxs, count) +
-      ncread(path_to_waccm*f3, "VTGWSPEC", start_idxs, count) +
-      ncread(path_to_waccm*f4, "BVTGWSPEC", start_idxs, count)
-
-    # Interpolating rho from cell faces to cell centers
-    # CAVEAT: to do the derivatives we need a few more points in Z than we're going to use
-    # so don't specify start_idxs and end_idxs such that z goes from 1 to end
-    # 2 to end-1 is the maximum safe range
-    rhoi = ncread(path_to_waccm*f2, "RHOI", start_idxs+[0,0,-1,0], count+[0,0,2,0])
-    rho = 0.5*(rhoi[:,:,1:end-1,:]+rhoi[:,:,2:end,:])
-    T = ncread(path_to_waccm*f1, "T", start_idxs+[0,0,-1,0], count+[0,0,1,0])
-
-    # mean-flow velocities
-    U = ncread(path_to_waccm*f1, "U", start_idxs, count)
-    V = ncread(path_to_waccm*f1, "V", start_idxs, count)
+    # Pull Z and rho up to +1 to cover thickness bounding limits 
+    Z_ext = ds1["Z3"][start_CI:(end_CI + e3)]
+    dz = abs.(Z_ext[:, :, 1:end-1, :] .- Z_ext[:, :, 2:end, :]) # Ensure positive thickness
     
-=#
-    # Computing potential temperature for N
-    g = 9.81      # gravitational acceleration, duh
-    R = 287.05    # gas constant of dry air
-    p0 = 1e5      # surface pressure in Pa
-    gamma = 1.4   # c_v/c_p for diatomic gases
-    p = R*rho.*T
-    th = @. T*(p0/p)^gamma
-    # NOTE: the below does (-d/dz log theta)/(-d/dz p). This is not intentional, but the minuses cancel out right.
-    N = @. -g*g*rho[:,:,2:end-1,:]*(log(th[:,:,3:end,:])-log(th[:,:,2:end-1,:]))/(p[:,:,3:end,:]-p[:,:,2:end-1,:])
-    #N = @. g*g*(rho[:,:,3:end,:]-rho[:,:,2:end-1,:])/(p[:,:,3:end,:]-p[:,:,2:end-1,:])
-    N = sqrt.(N.*(N.>0))
+    rhoi = ds2["RHOI"][start_CI:(end_CI + e3)]
+    rho  = 0.5 .* (rhoi[:, :, 1:end-1, :] .+ rhoi[:, :, 2:end, :])
+
+    # Extract Drags
+    ugw_drag = ds3["UTGWORO"][start_CI:end_CI] .* occursin("O", wtype) .+  # definitely orography
+               ds3["UTGWSPEC"][start_CI:end_CI] .* occursin("F", wtype) .+ # probably frontogenesis? nomenclature inconsistent
+               ds4["BUTGWSPEC"][start_CI:end_CI] .* occursin("C", wtype)   # Beres deep convection. Where shallow conv.?
+               
+    vgw_drag = ds3["VTGWORO"][start_CI:end_CI] .* occursin("O", wtype) .+
+               ds3["VTGWSPEC"][start_CI:end_CI] .* occursin("F", wtype) .+
+               ds4["BVTGWSPEC"][start_CI:end_CI] .* occursin("C", wtype)
+
+    # -----------------------------------------------------------
+    # Vectorized Drag -> Flux Integration
+    # Integrating from top down translates to a standard cumsum.
+    # -----------------------------------------------------------
+    dflxx = ugw_drag .* dz .* rho
+    dflxy = vgw_drag .* dz .* rho
     
-    return U, V, rho, N, lon, lat, Z, ugw, vgw, p
+    cum_dflxx = cumsum(dflxx, dims=3)
+    cum_dflxy = cumsum(dflxy, dims=3)
+    
+    UW = zeros(eltype(cum_dflxx), size(cum_dflxx))
+    VW = zeros(eltype(cum_dflxy), size(cum_dflxy))
+    
+    # Shift by 1: Flux at top of cell k is the drag deposited in all cells above it (1:k-1)
+    UW[:, :, 2:end, :] .= cum_dflxx[:, :, 1:end-1, :]
+    VW[:, :, 2:end, :] .= cum_dflxy[:, :, 1:end-1, :]
+
+    # Compute Background N
+    T = ds1["T"][start_CI:end_CI]
+    g, R, p0, kappa = 9.81, 287.05, 1e5, 2/7
+    
+    # p, th, T, and rho
+    p  = @. R * rho * T
+    th = @. T * (p0 / p)^kappa
+    
+    # Centered vertical differences (shrinks Z dimension by 2)
+    dp    = p[:, :, 3:end, :] .- p[:, :, 1:end-2, :]
+    dlnth = log.(th[:, :, 3:end, :]) .- log.(th[:, :, 1:end-2, :])
+    
+    N2_interior = @. -g^2 * rho[:, :, 2:end-1, :] * (dlnth / dp)
+    
+    # Pad edges to restore original Z dimension length
+    N2 = zeros(eltype(N2_interior), size(T))
+    N2[:, :, 2:end-1, :] .= N2_interior
+    N2[:, :, 1, :]       .= N2[:, :, 2, :]       # Duplicate top boundary
+    N2[:, :, end, :]     .= N2[:, :, end-1, :]   # Duplicate bottom boundary
+    
+    N = sqrt.(N2 .* (N2 .> 0))
+
+    close.([ds1, ds2, ds3, ds4])
+
+    # -----------------------------------------------------------
+    # FLIP Z-DIMENSION (Dim 3) TO MATCH WRF (Bottom-Up)
+    # -----------------------------------------------------------
+    U        = reverse(U, dims=3)
+    V        = reverse(V, dims=3)
+    UW       = reverse(UW, dims=3)
+    VW       = reverse(VW, dims=3)
+    ugw_drag = reverse(ugw_drag, dims=3)
+    vgw_drag = reverse(vgw_drag, dims=3)
+    rho      = reverse(rho, dims=3)
+    N        = reverse(N, dims=3)
+    Z3       = reverse(Z3, dims=3)
+    p        = reverse(p, dims=3)
+    th       = reverse(th, dims=3)
+    
+    z_indices_flipped = reverse(z_indices)
+    
+    dims_4d = (X(lon_vals), Y(lat_vals), Z(z_indices_flipped), Ti(time_vals))
+    
+    # Assigning to DimArrays
+    da_U   = DimArray(U, dims_4d; name=:U)
+    da_V   = DimArray(V, dims_4d; name=:V)
+    da_UW  = DimArray(UW, dims_4d; name=:UW)
+    da_VW  = DimArray(VW, dims_4d; name=:VW)
+    da_DX  = DimArray(ugw_drag, dims_4d; name=:DX)
+    da_DY  = DimArray(vgw_drag, dims_4d; name=:DY)
+    da_rho = DimArray(rho, dims_4d; name=:rho)
+    da_N   = DimArray(N, dims_4d; name=:N)
+    da_p   = DimArray(p, dims_4d; name=:p)
+    da_th  = DimArray(th, dims_4d; name=:th)
+    
+    # Spatial Metadata
+    da_lon = DimArray(lon_vals, (X(lon_vals),); name=:lon)
+    da_lat = DimArray(lat_vals, (Y(lat_vals),); name=:lat)
+    da_z   = DimArray(Z3, dims_4d; name=:z)
+    
+    return DimStack(da_U, da_V, da_UW, da_VW, da_DX, da_DY, da_rho, da_N, 
+                    da_p, da_th, da_z, da_lon, da_lat; 
+                    metadata=Dict("source" => "WACCM", "wtype" => wtype))
 end
 
 function load_momdep(start_idxs::Vector{Int64}, end_idxs::Vector{Int64}, verbose=true)

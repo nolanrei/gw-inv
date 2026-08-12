@@ -4,40 +4,37 @@ using LaTeXStrings
 include("omp.jl")
 closeall()
 
-sz = size(U)
-xi = 94 #rand(1:sz[1])   # x,y,t = 94,7,21 for known hard sideswipe case (need tb=800 in waccm_setup)
-yi = 7 #rand(1:sz[2])
+ds = waccm_ds
+sz = size(ds[:U])
+xi = rand(1:sz[1])   # x,y,t = 94,7,21 for known hard sideswipe case (need tb=800 in waccm_setup)
+yi = rand(1:sz[2])
 ti = 1
 te = sz[4]
-zb = 16    # 67km   (24    # 45km)
-ze = 50    # 10km
+zb = 1#15    # 67km   (24    # 45km)
+ze = 60#45    # 10km
 nz = ze-zb+1
 
-u = U[xi,yi,ze:-1:zb,ti:te]
-v = V[xi,yi,ze:-1:zb,ti:te]
-dx = ugw[xi,yi,ze:-1:zb,ti:te]
-dy = vgw[xi,yi,ze:-1:zb,ti:te]
+u = ds[:U][xi,yi,zb:ze,ti:te]
+v = ds[:V][xi,yi,zb:ze,ti:te]
+uw = ds[:UW][xi,yi,zb:ze,ti:te]
+vw = ds[:VW][xi,yi,zb:ze,ti:te]
 T = 3*(1:te-ti+1)
-z = 1e-3*Z[xi,yi,ze:-1:zb,ti]  #put it into km
 
-# find which times have nonzero drag and select one
-drag_presence = dropdims(sum(abs.(dx),dims=1) .+ sum(abs.(dy),dims=1), dims=1)
+# find which times have nonzero flux and select one
+drag_presence = dropdims(sum(abs.(uw),dims=1) .+ sum(abs.(vw),dims=1), dims=1)
 dragyes = findall(drag_presence .> 1e-8)
-t = 21 #rand(dragyes)
+t = rand(dragyes)
+z = parent(ds[:z][xi,yi,zb:ze,t])
 
-dz = Z[xi,yi,ze:-1:zb,t] .- Z[xi,yi,ze+1:-1:zb+1,t]
-col = ColumnProfile(u[:,t],v[:,t],N[xi,yi,ze:-1:zb,t],rho[xi,yi,ze:-1:zb,t],ze-zb+1,dz)
+dz = parent(ds[:z][xi,yi,zb:ze,t]) .- parent(ds[:z][xi,yi,(zb+1):(ze+1),t])
+col = ColumnProfile(u[:,t],v[:,t],ds[:N][xi,yi,zb:ze,t],ds[:rho][xi,yi,zb:ze,t],ze-zb+1,dz)
 
 ## Turn flux into drag
 # fluxvec[lvl] = flux at *top* of cell
 fluxvec = zeros(2nz)
-dflxx = dx[:,t].*dz.*rho[xi,yi,ze:-1:zb,t] # amount of x flux deposited in this cell
-dflxy = dy[:,t].*dz.*rho[xi,yi,ze:-1:zb,t]
-fluxvec[nz] = 0.0
-fluxvec[2nz] = 0.0
-for i = nz-1:-1:1
-    fluxvec[i]    = fluxvec[i+1]    + dflxx[i+1]  # minus sign from -1/rho df/dz cancels out minus sign from integrating down
-    fluxvec[i+nz] = fluxvec[i+1+nz] + dflxy[i+1]
+for zi = 1:nz
+    fluxvec[zi]    = ds[:UW][xi,yi,zi+zb-1,t]  #UW
+    fluxvec[zi+nz] = ds[:VW][xi,yi,zi+zb-1,t]  #VW
 end
 
 ## Find the prevailing direction of the drag -- this is for plotting only
@@ -45,13 +42,13 @@ end
 # take the absolute value along this direction, then take the mean again -- this should
 # minimize cancellation for mostly 1D data
 dir_tmp = zeros(2)
-dir_tmp[1] = mean(dx[:,t]); dir_tmp[2] = mean(dy[:,t])
+dir_tmp[1] = mean(uw[:,t]); dir_tmp[2] = mean(vw[:,t])
 dir_tmp ./= norm(dir_tmp)
 dir = zeros(2)
-for i = 1:size(dx,1)
-    sgn = sign(dir_tmp[1]*dx[i,t] + dir_tmp[2]*dy[i,t])  # is this level in same direction as dir_tmp?
-    dir[1] += sgn*dx[i,t]
-    dir[2] += sgn*dy[i,t]
+for i = 1:size(uw,1)
+    sgn = sign(dir_tmp[1]*uw[i,t] + dir_tmp[2]*vw[i,t])  # is this level in same direction as dir_tmp?
+    dir[1] += sgn*uw[i,t]
+    dir[2] += sgn*vw[i,t]
     # should have the effect of an absolute value along dir
 end
 dir ./= norm(dir)
@@ -61,10 +58,10 @@ max_nw = 20
 x = zeros(3*max_nw)
 nx = 0
 
-kw = 2pi/5e3
-src = 1
+kw = 2pi/5e4
+src = 2#find_tropopause(col.N, z; z_min=5, threshold=0.015, persistence_km=2)
 wav = c_to_wave(0.0, [1.0; 0.0], kw, 0.0, src)
-os = OMPStruct(col, L81_AD_wrapper!, wav; max_nw, fluxvec)
+os = OMPStruct(col, L81_AD_wrapper_leak!, wav; max_nw, fluxvec)
 #=
 #############################################################################################
 ## Special Testing Code -- launch two known half-breaking waves in a known sideswipe profile
@@ -91,7 +88,7 @@ os.fluxvec .= clean_signal .+ (sigma .* err)
 #############################################################################################
 =#
 ## Reconstruct
-reg = 1e-8
+reg = 0.0
 #nx = find_measure!(x,reg,os)
 ws = FullHessianOMPWorkspace(nz, max_nw)
 fgh_closure = make_full_hessian_fgh(os, ws, reg, os.sc)
@@ -169,7 +166,7 @@ end
 plot(1e3*reshape(fluxvec,(nz,2)),z,layout=2,label=["fx" "fy"])
 savefig("~/work/gw-inv/Figures/WACCM/Reconstructions/fluxvec.png")
 
-plot(hcat(dx[:,t],dy[:,t]),z,xlabel="drag (m/s^2)",ylabel="z (km)",label=["X" "Y"],layout=2)
+plot(hcat(ds[:DX][xi,yi,zb:ze,t],ds[:DY][xi,yi,zb:ze,t]),z,xlabel="drag (m/s^2)",ylabel="z (km)",label=["X" "Y"],layout=2)
 savefig("~/work/gw-inv/Figures/WACCM/Reconstructions/drags.png")
 
 plot((dir[1]*u[:,t]).+(dir[2]*v[:,t]),z,xlabel="windspeed (m/s)",ylabel="z (km)",label=nothing,title="windspeed in direction of GWs")
@@ -193,4 +190,4 @@ scatter(x[1:3:nx-2], x[2:3:nx-1], zcolor=x[3:3:nx],
     xlabel="theta (radians)", ylabel="c (m/s)", 
     label="Recon", markersize=5)
 savefig("waccm_spectrum.png")
-savefig(@sprintf("~/work/gw-inv/Figures/WACCM/Reconstructions/OMP/lat=%.2f,lon=%.2f,t=%d_flux.png",lat[yb+yi],lon[xi],tb+t))
+savefig(@sprintf("~/work/gw-inv/Figures/WACCM/Reconstructions/OMP/lat=%.2f,lon=%.2f,t=%d_flux.png", ds[:lat][yi], ds[:lon][xi],tb+t))
