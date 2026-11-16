@@ -4,8 +4,8 @@ using LinearAlgebra
 using Distributions # Needed for Gamma distribution
 using LaTeXStrings
 
-include("omp.jl")
-include("ensemble_accuracy.jl")
+include("../omp.jl")
+include("../ensemble_accuracy.jl")
 
 Random.seed!(501)
 sz = size(wrf_ds[:U])
@@ -62,7 +62,7 @@ xau = zeros(3*max_nw)
 
 nwnew=2
 nxnew=3*nwnew
-for iter = 1:3
+for iter = 1:1
     global nx = find_next_wave!(x, nx, reg, os; nwnew=2, max_f_calls=10000, pop_size=50, stride=2)
     #nx = find_next_wave!(x, nx, reg, os; nwnew=1,max_f_calls=50000, pop_size=30)
     #### DEBUG

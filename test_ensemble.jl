@@ -1,4 +1,4 @@
-include("../wrf-utils.jl")
+include("wrf-utils.jl")
 include("ensemble_accuracy.jl")
 
 # You need to load in a dataset before
@@ -49,15 +49,16 @@ plot!(display,z,label=["recon X" "recon Y"])
 savefig("tst1.png")
 U = wrf_ds[:U_raw][xs[i],ys[i],:,ts[i]]
 V = wrf_ds[:V_raw][xs[i],ys[i],:,ts[i]]
-ros = rosette(spectra[i,1:nxs[i]],nxs[i])
+rosmap = rosette_heatmap(spectra[i,1:nxs[i]],nxs[i],cmax=100)
 r = hypot(U[src],V[src])
 theta = atan(V[src],U[src])
-plot!(ros,[0,theta],[0,r],arrow=true)
-savefig(ros,"rosette.png")
-ros2 = rosette(ks_rag[i], length(ks_rag[i]))
-savefig(ros2,"rosette_known.png")
+plot!(rosmap,[0,theta],[0,r],arrow=true)
+rosette!(rosmap, ks_rag[i], length(ks_rag[i]))
+savefig(rosmap,"rosette.png")
 srcs,prox = src_check(spectra[i,:],nxs[i],fluxes[i,:],U,V,wrf_ds[:iz]; thresh=12.0, cutoff_ang=pi/6)
 end
+
+
 
 begin
 plot(rms_abs_err_z[src:end],z[src:end], xlabel="flux abs. error", ylabel="z (km)", label=["err X" "err Y"])

@@ -1,0 +1,12 @@
+*.csv
+*.png
+*.pdf
+*.ipynb
+*.out
+*.nc
+*.nc4
+*.sb
+*.sbatch
+*-checkpoint.jl
+tmp*
+*.gif

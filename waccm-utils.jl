@@ -4,130 +4,143 @@ using Random
 using Dates
 using DimensionalData
 
-"""
-    load_waccm_stack(start_idxs::Vector{Int}, end_idxs::Vector{Int}; wtype="OFC") -> DimStack
+# (tag, dataset index, zonal var, meridional var)
+const WACCM_GW_SOURCES = (
+    ('O', 3, "UTGWORO",   "VTGWORO"),    # orography
+    ('F', 3, "UTGWSPEC",  "VTGWSPEC"),   # frontogenesis (probably)
+    ('C', 4, "BUTGWSPEC", "BVTGWSPEC"),  # Beres deep convection
+)
 
-Loads raw subsets of WACCM data and maps them directly to a standardized DimStack.
 """
-function load_waccm_stack(start_idxs::Vector{Int}, end_idxs::Vector{Int}; wtype="OFC")
+    drag_to_flux(drag, dz, rho)
+
+Integrate drag from the model top downward. Flux at the top of cell k is the
+drag deposited in all cells above it (1:k-1). Assumes top-down z ordering.
+"""
+function drag_to_flux(drag, dz, rho)
+    cum = cumsum(drag .* dz .* rho, dims=3)
+    flx = zeros(eltype(cum), size(cum))
+    flx[:, :, 2:end, :] .= @view cum[:, :, 1:end-1, :]
+    return flx
+end
+
+"""
+    load_waccm_stack(start_idxs, end_idxs; wtype="OFC", separate=false) -> DimStack
+
+Loads raw subsets of WACCM data into a standardized DimStack.
+`wtype` selects which sources are summed into UW/VW/DX/DY.
+If `separate=true`, each selected source is also stored individually as
+UW_<tag>, VW_<tag>, DX_<tag>, DY_<tag> (tag ∈ O, F, C).
+"""
+function load_waccm_stack(start_idxs::Vector{Int}, end_idxs::Vector{Int};
+                          wtype="OFC", separate=false)
     path_to_waccm = "/scratch/nr2489/waccm_1yr/"
-    
+
     ds1 = NCDataset(joinpath(path_to_waccm, "Input1_year1.nc"), "r")
     ds2 = NCDataset(joinpath(path_to_waccm, "Input2_year1.nc"), "r")
     ds3 = NCDataset(joinpath(path_to_waccm, "Input3_year1.nc"), "r")
     ds4 = NCDataset(joinpath(path_to_waccm, "Input4_year1.nc"), "r")
-    
+    dss = (ds1, ds2, ds3, ds4)
+
     lon_vals  = ds1["lon"][start_idxs[1]:end_idxs[1]]
     lat_vals  = ds1["lat"][start_idxs[2]:end_idxs[2]]
     time_vals = ds1["time"][start_idxs[4]:end_idxs[4]]
-    z_indices = start_idxs[3]:end_idxs[3] 
-    
+    z_indices = start_idxs[3]:end_idxs[3]
+
     start_CI = CartesianIndex(start_idxs...)
-    end_CI = CartesianIndex(end_idxs...)
+    end_CI   = CartesianIndex(end_idxs...)
     e3 = CartesianIndex(0, 0, 1, 0)
-    
+
     # Base variables
     U = ds1["U"][start_CI:end_CI]
     V = ds1["V"][start_CI:end_CI]
+    Z3 = ds1["Z3"][start_CI:end_CI] / 1e3  # km
 
-    Z3 = ds1["Z3"][start_CI:end_CI]/1e3  # convert to km
-    
-    # Pull Z and rho up to +1 to cover thickness bounding limits 
     Z_ext = ds1["Z3"][start_CI:(end_CI + e3)]
-    dz = abs.(Z_ext[:, :, 1:end-1, :] .- Z_ext[:, :, 2:end, :]) # Ensure positive thickness
-    
+    dz = abs.(Z_ext[:, :, 1:end-1, :] .- Z_ext[:, :, 2:end, :])
+
     rhoi = ds2["RHOI"][start_CI:(end_CI + e3)]
     rho  = 0.5 .* (rhoi[:, :, 1:end-1, :] .+ rhoi[:, :, 2:end, :])
 
-    # Extract Drags
-    ugw_drag = ds3["UTGWORO"][start_CI:end_CI] .* occursin("O", wtype) .+  # definitely orography
-               ds3["UTGWSPEC"][start_CI:end_CI] .* occursin("F", wtype) .+ # probably frontogenesis? nomenclature inconsistent
-               ds4["BUTGWSPEC"][start_CI:end_CI] .* occursin("C", wtype)   # Beres deep convection. Where shallow conv.?
-               
-    vgw_drag = ds3["VTGWORO"][start_CI:end_CI] .* occursin("O", wtype) .+
-               ds3["VTGWSPEC"][start_CI:end_CI] .* occursin("F", wtype) .+
-               ds4["BVTGWSPEC"][start_CI:end_CI] .* occursin("C", wtype)
-
     # -----------------------------------------------------------
-    # Vectorized Drag -> Flux Integration
-    # Integrating from top down translates to a standard cumsum.
+    # Drags: read only the requested sources, sum them, and
+    # optionally keep each one separately
     # -----------------------------------------------------------
-    dflxx = ugw_drag .* dz .* rho
-    dflxy = vgw_drag .* dz .* rho
-    
-    cum_dflxx = cumsum(dflxx, dims=3)
-    cum_dflxy = cumsum(dflxy, dims=3)
-    
-    UW = zeros(eltype(cum_dflxx), size(cum_dflxx))
-    VW = zeros(eltype(cum_dflxy), size(cum_dflxy))
-    
-    # Shift by 1: Flux at top of cell k is the drag deposited in all cells above it (1:k-1)
-    UW[:, :, 2:end, :] .= cum_dflxx[:, :, 1:end-1, :]
-    VW[:, :, 2:end, :] .= cum_dflxy[:, :, 1:end-1, :]
+    active = filter(s -> occursin(s[1], wtype), WACCM_GW_SOURCES)
+    isempty(active) && error("wtype=\"$wtype\" selects no sources (use some of O, F, C)")
 
-    # Compute Background N
+    ugw_drag = zeros(eltype(U), size(U))
+    vgw_drag = zeros(eltype(V), size(V))
+    components = Tuple{Char, Array, Array}[]   # (tag, du, dv), top-down
+
+    for (tag, di, uname, vname) in active
+        du = dss[di][uname][start_CI:end_CI]
+        dv = dss[di][vname][start_CI:end_CI]
+        ugw_drag .+= du
+        vgw_drag .+= dv
+        separate && push!(components, (tag, du, dv))
+    end
+
+    # Drag -> flux (integrate top-down, before flipping)
+    UW = drag_to_flux(ugw_drag, dz, rho)
+    VW = drag_to_flux(vgw_drag, dz, rho)
+
+    # Background N
     T = ds1["T"][start_CI:end_CI]
     g, R, p0, kappa = 9.81, 287.05, 1e5, 2/7
-    
-    # p, th, T, and rho
+
     p  = @. R * rho * T
     th = @. T * (p0 / p)^kappa
-    
-    # Centered vertical differences (shrinks Z dimension by 2)
+
     dp    = p[:, :, 3:end, :] .- p[:, :, 1:end-2, :]
     dlnth = log.(th[:, :, 3:end, :]) .- log.(th[:, :, 1:end-2, :])
-    
     N2_interior = @. -g^2 * rho[:, :, 2:end-1, :] * (dlnth / dp)
-    
-    # Pad edges to restore original Z dimension length
+
     N2 = zeros(eltype(N2_interior), size(T))
     N2[:, :, 2:end-1, :] .= N2_interior
-    N2[:, :, 1, :]       .= N2[:, :, 2, :]       # Duplicate top boundary
-    N2[:, :, end, :]     .= N2[:, :, end-1, :]   # Duplicate bottom boundary
-    
+    N2[:, :, 1, :]       .= N2[:, :, 2, :]
+    N2[:, :, end, :]     .= N2[:, :, end-1, :]
     N = sqrt.(N2 .* (N2 .> 0))
 
-    close.([ds1, ds2, ds3, ds4])
+    close.(dss)
 
     # -----------------------------------------------------------
-    # FLIP Z-DIMENSION (Dim 3) TO MATCH WRF (Bottom-Up)
+    # Flip Z (dim 3) to match WRF (bottom-up)
     # -----------------------------------------------------------
-    U        = reverse(U, dims=3)
-    V        = reverse(V, dims=3)
-    UW       = reverse(UW, dims=3)
-    VW       = reverse(VW, dims=3)
-    ugw_drag = reverse(ugw_drag, dims=3)
-    vgw_drag = reverse(vgw_drag, dims=3)
-    rho      = reverse(rho, dims=3)
-    N        = reverse(N, dims=3)
-    Z3       = reverse(Z3, dims=3)
-    p        = reverse(p, dims=3)
-    th       = reverse(th, dims=3)
-    
+    flipz(A) = reverse(A, dims=3)
     z_indices_flipped = reverse(z_indices)
-    
     dims_4d = (X(lon_vals), Y(lat_vals), Z(z_indices_flipped), Ti(time_vals))
-    
-    # Assigning to DimArrays
-    da_U   = DimArray(U, dims_4d; name=:U)
-    da_V   = DimArray(V, dims_4d; name=:V)
-    da_UW  = DimArray(UW, dims_4d; name=:UW)
-    da_VW  = DimArray(VW, dims_4d; name=:VW)
-    da_DX  = DimArray(ugw_drag, dims_4d; name=:DX)
-    da_DY  = DimArray(vgw_drag, dims_4d; name=:DY)
-    da_rho = DimArray(rho, dims_4d; name=:rho)
-    da_N   = DimArray(N, dims_4d; name=:N)
-    da_p   = DimArray(p, dims_4d; name=:p)
-    da_th  = DimArray(th, dims_4d; name=:th)
-    
-    # Spatial Metadata
+
+    da_U   = DimArray(flipz(U),        dims_4d; name=:U)
+    da_V   = DimArray(flipz(V),        dims_4d; name=:V)
+    da_UW  = DimArray(flipz(UW),       dims_4d; name=:UW)
+    da_VW  = DimArray(flipz(VW),       dims_4d; name=:VW)
+    da_DX  = DimArray(flipz(ugw_drag), dims_4d; name=:DX)
+    da_DY  = DimArray(flipz(vgw_drag), dims_4d; name=:DY)
+    da_rho = DimArray(flipz(rho),      dims_4d; name=:rho)
+    da_N   = DimArray(flipz(N),        dims_4d; name=:N)
+    da_p   = DimArray(flipz(p),        dims_4d; name=:p)
+    da_th  = DimArray(flipz(th),       dims_4d; name=:th)
+    da_z   = DimArray(flipz(Z3),       dims_4d; name=:z)
+
+    # Per-source arrays (empty if separate=false)
+    comp_das = DimArray[]
+    for (tag, du, dv) in components
+        push!(comp_das,
+            DimArray(flipz(drag_to_flux(du, dz, rho)), dims_4d; name=Symbol("UW_", tag)),
+            DimArray(flipz(drag_to_flux(dv, dz, rho)), dims_4d; name=Symbol("VW_", tag)),
+            DimArray(flipz(du), dims_4d; name=Symbol("DX_", tag)),
+            DimArray(flipz(dv), dims_4d; name=Symbol("DY_", tag)),
+        )
+    end
+
     da_lon = DimArray(lon_vals, (X(lon_vals),); name=:lon)
     da_lat = DimArray(lat_vals, (Y(lat_vals),); name=:lat)
-    da_z   = DimArray(Z3, dims_4d; name=:z)
-    
-    return DimStack(da_U, da_V, da_UW, da_VW, da_DX, da_DY, da_rho, da_N, 
-                    da_p, da_th, da_z, da_lon, da_lat; 
-                    metadata=Dict("source" => "WACCM", "wtype" => wtype))
+
+    return DimStack(da_U, da_V, da_UW, da_VW, da_DX, da_DY, da_rho, da_N,
+                    da_p, da_th, da_z, da_lon, da_lat, comp_das...;
+                    metadata=Dict("source" => "WACCM", "wtype" => wtype,
+                                  "separate" => separate))
 end
 
 function load_momdep(start_idxs::Vector{Int64}, end_idxs::Vector{Int64}, verbose=true)

@@ -2,8 +2,8 @@
 include("tron_defs.jl")
 
 sz = size(U)
-xi = rand(1:sz[1]) #150
-yi = rand(1:sz[2]) #9
+xi = 94 #rand(1:sz[1])   # x,y,t = 94,7,21 for known hard sideswipe case (need tb=800 in waccm_setup)
+yi = 7 #rand(1:sz[2])
 ti = 1
 te = sz[4]
 zb = 16    # 67km   (24    # 45km)
@@ -19,8 +19,8 @@ z = 1e-3*Z[xi,yi,ze:-1:zb,ti]  #put it into km
 
 # find which times have nonzero drag and select one to plot the angle of
 drag_presence = dropdims(sum(abs.(dx),dims=1) .+ sum(abs.(dy),dims=1), dims=1)
-dragyes = findall(drag_presence .> 0.0)
-t = rand(dragyes)
+dragyes = findall(drag_presence .> 1e-8)
+t = 21 #rand(dragyes)
 
 dz = Z[xi,yi,ze:-1:zb,t] .- Z[xi,yi,ze+1:-1:zb+1,t]
 col = ColumnProfile(u[:,t],v[:,t],N[xi,yi,ze:-1:zb,t],rho[xi,yi,ze:-1:zb,t],ze-zb+1,dz)
@@ -48,7 +48,7 @@ cstride = 1
 ndirs = 1   
 src = 1         # source level = 10km
 wavespds = Array(cmin:cstride:cmax)
-kw = 2pi/5e5
+kw = 2pi/5e4
 nws = length(wavespds)
 ref_flux = 1e-3
 nw = nws*ndirs
@@ -70,17 +70,22 @@ for i = nz-1:-1:1
     fluxvec[i+nz] = fluxvec[i+1+nz] + dflxy[i+1]
 end
 
+# testing with a sample wave
+wav_test = c_to_wave(10*randn(),dir,kw,ref_flux,src)
+#fluxvec .= 0.0
+#L81_flux!(wav_test,col,ref_flux,fluxvec) ## overwriting fluxvec!
+
 plot(1e3*reshape(fluxvec,(nz,2)),z,layout=2,label=["fx" "fy"])
-savefig("~/work/minimization/Figures/WACCM/Reconstructions/fluxvec.png")
+savefig("~/work/gw-inv/Figures/WACCM/Reconstructions/fluxvec.png")
 
 begin
 plot(hcat(dx[:,t],dy[:,t]),z,xlabel="drag (m/s^2)",ylabel="z (km)",label=["X" "Y"],layout=2)
-savefig("~/work/minimization/Figures/WACCM/Reconstructions/drags.png")
+savefig("~/work/gw-inv/Figures/WACCM/Reconstructions/drags.png")
 end
 
 begin
 plot((dir[1]*u[:,t]).+(dir[2]*v[:,t]),z,xlabel="windspeed (m/s)",ylabel="z (km)",label=nothing,title="windspeed in direction of GWs")
-savefig("~/work/minimization/Figures/WACCM/Reconstructions/windspeed.png")
+savefig("~/work/gw-inv/Figures/WACCM/Reconstructions/windspeed.png")
 end
 
 ### Solve using JSOSolvers.jl
@@ -90,11 +95,11 @@ stats = solve!(solver, nlp; verbose=5)
 
 ## Plot
 plot(wavespds, 1e3*stats.solution, xlabel="phase speed (m/s)", ylabel="flux (mPa)", label=nothing)
-savefig(@sprintf("~/work/minimization/Figures/WACCM/Reconstructions/lat=%.2f,lon=%.2f,t=%d.png",lat[yb+yi],lon[xi],tb+t))
+savefig(@sprintf("~/work/gw-inv/Figures/WACCM/Reconstructions/lat=%.2f,lon=%.2f,t=%d.png",lat[yb+yi],lon[xi],tb+t))
 
 begin
 recon_momdep = spectrum_to_momdep(L81_flux!,waves,col,stats.solution)
 plot(1e3*reshape(fluxvec,(nz,2)),z,layout=2,xlabel="flux (mPa)",ylabel="z (km)",label=["fx" "fy"])
 plot!(1e3*reshape(recon_momdep,(nz,2)),z,layout=2,label=["x recon" "y recon"])
-savefig(@sprintf("~/work/minimization/Figures/WACCM/Reconstructions/lat=%.2f,lon=%.2f,t=%d_flux.png",lat[yb+yi],lon[xi],tb+t))
+savefig(@sprintf("~/work/gw-inv/Figures/WACCM/Reconstructions/lat=%.2f,lon=%.2f,t=%d_flux.png",lat[yb+yi],lon[xi],tb+t))
 end

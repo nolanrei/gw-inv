@@ -314,11 +314,90 @@ function y_to_x!(x, y, sc, nw; iw_start=0)
     return nothing
 end
 
+# Source-level saturation bound
+function source_bound(th, c, wav::WaveProfile, col::ColumnProfile)
+    absk = hypot(wav.k, wav.l)
+    s  = wav.src
+    vb = col.U[s]*cos(th) + col.V[s]*sin(th)
+    return col.rho[s] * 0.5 * absk * abs(c - vb)^3 / (col.N[s] + 1e-15)
+end
+
+# Clamp launched flux to what the forward model can actually see
+function clamp_to_source!(x::AbstractVector, nx::Int, os::OMPStruct)
+    for i = 1:div(nx, 3)
+        b = source_bound(x[3i-2], x[3i-1], os.wav, os.col)
+        x[3i] = min(x[3i], b)
+    end
+    return nothing
+end
+
+function sharpen_thresh!(x::AbstractVector, nx::Int64, os::OMPStruct, 
+        bic_opts::BICOptions, fgh_closure; verbose=false, params)
+    # Simple sharpen step that drops waves with amplitudes below a threshold
+
+    thresh = params[1]     # we only need one thing in params
+    
+    nw = div(nx, 3)
+    nz2 = 2 * length(os.col.U)
+    sc = os.sc
+
+    x_to_y!(x, x, sc, nw)
+
+    # sharpen
+
+    options = Optim.Options(
+        iterations=50,
+        show_trace = false,
+    )
+    
+    lenx = length(x)
+    resize!(x,nx)
+    res = Optim.optimize(Optim.only_fgh!(fgh_closure), x, NewtonTrustRegion(), options)
+    if verbose
+        println(res.minimizer)
+    end
+    x[1:nx] .= res.minimizer
+    resize!(x,lenx)
+
+    y_to_x!(x,x,sc,nw)
+    clamp_to_source!(x, nx, os)
+
+    # threshold
+    idx = 1
+    nw_t = nw
+    for i = 1:nw
+        # kill any waves with flux less than 0.01 mPa
+        if x[3i] <= thresh
+            x[3i-2] = x[3i-1] = x[3i] = 0.0
+            nw_t -= 1
+            continue
+        end
+        # contract to fill space
+        x[3idx-2] = x[3i-2]
+        x[3idx-1] = x[3i-1]
+        x[3idx]   = x[3i]
+        idx += 1
+    end
+
+    # Map th and c onto [0, 2pi) and [0.0, MAX_C]
+    for i = 0:nw-1
+        if x[3i+2] < 0
+            x[3i+2] *= -1
+            x[3i+1] += pi
+        end
+        x[3i+1] = mod(x[3i+1], 2pi)
+        x[3i+2] = min(x[3i+2], MAX_C)
+    end
+    return 3*nw_t
+end
+
 function fb_sharpen_adaptive!(x::AbstractVector, nx::Int64, os::OMPStruct, 
-        bic_opts::BICOptions, fgh_closure; verbose=false, fast=false)
+        bic_opts::BICOptions, fgh_closure; verbose=false, params)
     # Forward-Backward step
     # Start with a solution then remove each wave in turn, getting rid of the ones
     # that don't sufficiently improve the solution
+
+    fast = params[1]  # params only needs to hold fast
 
     # NOTE: reg is baked into fgh_closure
     nw = div(nx, 3)
@@ -331,9 +410,11 @@ function fb_sharpen_adaptive!(x::AbstractVector, nx::Int64, os::OMPStruct,
     bic_x = evaluate_bic(x,nx,os, bic_opts)
 
     x_to_y!(x, x, sc, nw)
-
-    options = Optim.Options(iterations=50)  #, show_trace=true
-
+    
+    options = Optim.Options(
+        iterations=50,
+        show_trace = false,
+    )
     
     lenx = length(x)
     resize!(x,nx)
@@ -360,7 +441,10 @@ function fb_sharpen_adaptive!(x::AbstractVector, nx::Int64, os::OMPStruct,
             pack_surviving_parameters!(os.xcopy, x, nw, drop_idx)
 
             if fast
+                # cost needs to be evaluated in x space
+                y_to_x!(os.xcopy, os.xcopy, sc, nw-1)
                 score = cost(os.xcopy, target_dim, 1e-8, os)  # Not too happy about this but we don't have reg
+                x_to_y!(os.xcopy, os.xcopy, sc, nw-1)
             else
                 res = Optim.optimize(Optim.only_fgh!(fgh_closure), os.xcopy, 
                                         NewtonTrustRegion(), options)
@@ -429,23 +513,23 @@ function fb_sharpen_adaptive!(x::AbstractVector, nx::Int64, os::OMPStruct,
     return nx
 end
 
-function find_measure!(x::Vector{Float64}, reg::Float64, os::OMPStruct, 
-        ws::Union{FullHessianOMPWorkspace,Nothing}, bic_opts::BICOptions;
-    fast_sharpen=true)
+function find_measure!(x::Vector{Float64}, reg::Float64, os::OMPStruct,
+        sharpen!::Function, ws::Union{FullHessianOMPWorkspace,Nothing}, 
+        bic_opts::BICOptions; sharpen_params,zis=nothing)
     nz = length(os.col.U)
     nz2 = 2 * nz
     nx = 0  
     fill!(x, 0.0)
 
     max_nx = 3*os.maxwaves
-    BIC_prev = evaluate_bic(x, nx, os)
+    BIC_prev = evaluate_bic(x, nx, os, bic_opts)
     nx_best = 0 
 
     if isnothing(ws)
         ws = FullHessianOMPWorkspace(nz, os.maxwaves)
     end
 
-    fgh_closure = make_full_hessian_fgh(os, ws, reg, os.sc)
+    fgh_closure = make_full_hessian_fgh(os, ws, reg, os.sc, zis=zis)
 
     nwnew = 2
     while nx + 3*nwnew <= max_nx
@@ -454,12 +538,13 @@ function find_measure!(x::Vector{Float64}, reg::Float64, os::OMPStruct,
         nx_prev = nx
 
         # 1. Find new wave candidate (greedy step)   -- O(50ms)
-        nx = find_next_wave!(x, nx, reg, os; nwnew, max_f_calls=10000, pop_size=50, stride=2)
+        nx = find_next_wave!(x, nx, reg, os; nwnew, max_f_calls=5000, pop_size=50, stride=1)
+        clamp_to_source!(x, nx, os)
         #### DEBUG
         #println("find_measure!: new x start, nx=$nx \n", x[1:nx])
 
         # 2. Optimize over all parameters      -- O(1ms * (nw/4)^2 * nw)
-        nx = fb_sharpen_adaptive!(x, nx, os, bic_opts, fgh_closure; reltol=0.0, fast=fast_sharpen)
+        nx = sharpen!(x, nx, os, bic_opts, fgh_closure; params=sharpen_params)
 
         #println("find_measure!: post-sharpen, nx=$nx \n", x[1:nx])
 
@@ -503,11 +588,13 @@ function get_score(params::AbstractVector, f_guess::Float64, os::OMPStruct)
     return out
 end
 
-function make_full_hessian_fgh(os::OMPStruct, ws::FullHessianOMPWorkspace, reg::Float64, sc::SVector)
+function make_full_hessian_fgh(os::OMPStruct, ws::FullHessianOMPWorkspace, reg::Float64, sc::SVector; zis=nothing)
+    nz2 = ws.nz2
+    nz = div(nz2,2)
+    window = isnothing(zis) ? collect(1:nz2) : vcat(collect(zis), collect(zis) .+ nz)
     
     return function fgh!(f, g, H, x)
         n_waves = div(length(x), 3)
-        nz2 = ws.nz2
         
         # --- 1. FORWARD PASS (Seeding & Vector Hyper-AD) ---
         fill!(ws.sum_W, 0.0)
@@ -550,20 +637,20 @@ function make_full_hessian_fgh(os::OMPStruct, ws::FullHessianOMPWorkspace, reg::
             os.prop_AD!(prof_buf, p_seeded_scaled, os.wav, os.col; ksig=os.ksig)
             
             # Accumulate the real values into the total model profile
-            @inbounds for i in 1:nz2
+            @inbounds for i in window#1:nz2
                 ws.sum_W[i] += prof_buf[i].value.value
             end
         end
         
         # Compute master residual vector: r = target - model
-        @inbounds for i in 1:nz2
+        @inbounds for i in window#1:nz2
             ws.r[i] = os.fluxvec[i] - ws.sum_W[i]
         end
         
         # --- 2. COMPUTE COST FUNCTION ---
         if f !== nothing
             cost = 0.0
-            @inbounds for i in 1:nz2
+            @inbounds for i in window#1:nz2
                 cost += ws.r[i]^2
             end
             cost *= 0.5
@@ -585,7 +672,7 @@ function make_full_hessian_fgh(os::OMPStruct, ws::FullHessianOMPWorkspace, reg::
                 # g_k = -J_k' * r
                 for col in 1:3
                     val = 0.0
-                    @inbounds for row in 1:nz2
+                    @inbounds for row in window#1:nz2
                         val -= prof_k[row].value.partials[col] * ws.r[row]
                     end
                     g_k[col] = val
@@ -613,7 +700,7 @@ function make_full_hessian_fgh(os::OMPStruct, ws::FullHessianOMPWorkspace, reg::
                         for r in 1:3
                             r_idx = 3*k - 3 + r
                             v = 0.0
-                            @inbounds for i in 1:nz2
+                            @inbounds for i in window#1:nz2
                                 v += prof_k[i].value.partials[r] * prof_m[i].value.partials[c]
                             end
                             H[r_idx, c_idx] = v
@@ -628,7 +715,7 @@ function make_full_hessian_fgh(os::OMPStruct, ws::FullHessianOMPWorkspace, reg::
                             for r in 1:3
                                 r_idx = 3*k - 3 + r
                                 v_corr = 0.0
-                                @inbounds for i in 1:nz2
+                                @inbounds for i in window#1:nz2
                                     v_corr -= ws.r[i] * prof_k[i].partials[r].partials[c]
                                 end
                                 H[r_idx, c_idx] += v_corr
@@ -645,7 +732,78 @@ function make_full_hessian_fgh(os::OMPStruct, ws::FullHessianOMPWorkspace, reg::
         return f
     end
 end
+#=
+function make_lm_resjac!(os::OMPStruct, ws::LMWorkspace, sc::SVector)
 
+    return function resjac!(r, J, x)
+
+        nw  = div(length(x), 3)
+        nz2 = ws.nz2
+
+        fill!(ws.sum_W, 0.0)
+        fill!(r, 0.0)
+
+        for k in 1:nw
+
+            # Seed the 3 parameters of this wave
+            for i in 1:3
+                val = x[3*(k-1)+i]
+
+                ws.p_seeded[i] = D1(
+                    val,
+                    ForwardDiff.Partials((
+                        i == 1 ? 1.0 : 0.0,
+                        i == 2 ? 1.0 : 0.0,
+                        i == 3 ? 1.0 : 0.0
+                    ))
+                )
+            end
+
+            p_scaled = SA[
+                sc[1] * ws.p_seeded[1],
+                sc[2] * ws.p_seeded[2],
+                sc[3] * ws.p_seeded[3]^2
+            ]
+
+            prof = ws.profile_buffers[k]
+
+            os.prop_AD!(
+                prof,
+                p_scaled,
+                os.wav,
+                os.col;
+                ksig=os.ksig
+            )
+
+            @inbounds for i in 1:nz2
+                ws.sum_W[i] += prof[i].value
+            end
+        end
+
+        # residual
+        @inbounds for i in 1:nz2
+            r[i] = os.fluxvec[i] - ws.sum_W[i]
+        end
+
+        # Jacobian of residual
+        fill!(J, 0.0)
+
+        for k in 1:nw
+            prof = ws.profile_buffers[k]
+
+            cols = (3k-2):(3k)
+
+            @inbounds for i in 1:nz2
+                for j in 1:3
+                    J[i, cols[j]] = -prof[i].partials[j]
+                end
+            end
+        end
+
+        return nothing
+    end
+end
+=#
 function L81_AD_wrapper!(flux_out::AbstractVector, wave_params::AbstractVector, 
                          wav::WaveProfile, col::ColumnProfile; 
                          ksig::Float64=20.0, stride::Int64=1,
@@ -803,4 +961,150 @@ function L81_AD_wrapper_leak!(flux_out::AbstractVector, wave_params::AbstractVec
         vb = vt
         bb = bt
     end
+end
+
+struct MK99Workspace
+    m::AbstractVector                    # workspace for m values
+    m1::AbstractVector                   # last step's m workspace
+    uu::AbstractVector                   # workspace for rho uu values
+    uu1::AbstractVector                  # last step's rho uu values
+    idxs::Vector{Int64}                  # index vector for keeping track of sorting
+    idxs1::Vector{Int64}                 # last step's index vector
+    beta1::Vector{Float64}               # last step's betas
+end
+
+function MK99Workspace(max_nw::Int64)
+    mw = zeros(max_nw)
+    m1w = zeros(max_nw)
+    uuw = zeros(max_nw)
+    uu1w = zeros(max_nw)
+    idxsw = zeros(Int64, max_nw)
+    idxs1w = zeros(Int64, max_nw)
+    betas1w = zeros(max_nw)
+    return MK99Workspace(mw, m1w, uuw, uu1w, idxsw, idxs1w, betas1w)
+end
+
+function MK99!(flux_out::AbstractVector,             # output fluxes. 2nz tall
+               x::AbstractVector,                    # input waves, used length nx
+               nx::Int64,                            # length of x
+               col::ColumnProfile,                   # column parameters (U, V, N, rho)
+               dummy_wav::WaveProfile,               # stores parameters of waves we keep constant
+               z::AbstractVector,                    # vertical grid (km)
+               wk::MK99Workspace                     # stores all the memory needed
+    )
+    # Implements the Medvedev-Klaasen 1999 method for gravity wave parameterization
+    # A critical component is that it evolves all waves together
+    fill!(flux_out,0)
+    
+    nz2 = length(flux_out)
+    nz = div(nz2,2)
+    nw = div(nx,3)
+    sq2 = sqrt(2)
+    sq2pi = sqrt(2pi)
+
+    K = dummy_wav.k
+    src = dummy_wav.src
+    tiny = 1e-20
+
+    Uz = col.U[src]
+    Vz = col.V[src]
+    rhoz = col.rho[src]
+    Nz = col.N[src]
+
+    lenm = length(wk.m)   # we allow our workspace to be longer than the number of waves it currently holds
+    # but we need to logically resize wk.m and wk.idxs to prevent the sorting from
+    # accessing stuff out of bounds
+    resize!(wk.m,nw)
+    resize!(wk.idxs,nw)
+
+    # initialize workspace
+    for j = 1:nw
+        th = x[3j-2]
+        c = x[3j-1]
+        f = x[3j]
+        u = cos(th)*Uz + sin(th)*Vz   # initialized above
+        wk.m[j] = Nz/(c-u)
+        wk.uu[j] = abs(wk.m[j])/K * f    # rho uu = m/k rho uw  (we are evolving rho uu instead of uu)
+        # abs(m) instead of m because <uu> needs to be positive physically (also gives right flux direction)
+
+        flux_out[src]    += cos(th)*K/wk.m[j]*wk.uu[j]   # we need to record the flux here too
+        flux_out[src+nz] += sin(th)*K/wk.m[j]*wk.uu[j]
+    end
+    sortperm!(wk.idxs, wk.m)
+    # we need to compute beta at source level
+    for j = nw:-1:1
+        ij = wk.idxs[j]
+        m = wk.m[ij]
+        sigma = 0.0
+        for n = j:nw
+            sigma  += wk.uu[wk.idxs[n]]
+        end
+        sigma  = sqrt(sigma/rhoz)
+        alpha = Nz/(sq2 * m * sigma)
+        wk.beta1[j] = sq2pi * Nz/sigma * exp(-alpha*alpha)   # damping strength
+    end
+    
+    for zi = src+1:nz     # src is where the values are prescribed, so we start computing one level above
+        Uz1 = Uz; Vz1 = Vz; rhoz1 = rhoz; Nz1 = Nz
+        Uz = col.U[zi]
+        Vz = col.V[zi]
+        rhoz = col.rho[zi]
+        Nz = col.N[zi]
+        dz = (z[zi] - z[zi-1])*1000    # turn it into meters
+        # compute m values
+        for j = 1:nw
+            # move over last step's values
+            wk.m1[j] = wk.m[j]
+            wk.idxs1[j] = wk.idxs[j]
+            wk.uu1[j] = wk.uu[j]
+            
+            th = x[3j-2]
+            c = x[3j-1]
+            u = cos(th)*Uz + sin(th)*Vz
+            wk.m[j] = Nz/(c-u)
+        end
+
+        # sort m values
+        sortperm!(wk.idxs, wk.m)
+
+        # compute nonlinear effects and update from zi-1 to zi
+        for j = nw:-1:1         # compute largest-m to smallest-m to get the correct trapezoid rule on beta
+            ij = wk.idxs[j]
+            m = wk.m[ij]
+            m1 = wk.m1[ij]    # needs to refer to the same wave
+
+            # this is our nonlinear coupling
+            sigma = 0.0
+            for n = j:nw   # yes we do count the wave itself in the background field
+                # because we're computing uu(zi) from biggest m to smallest 
+                # we have sigma except for at n==j, where we default to uu(z_i-1)
+                sigma  += wk.uu[wk.idxs[n]]
+            end
+            sigma  = sqrt(sigma/rhoz + tiny)
+
+            alpha = Nz/(sq2 * m * sigma)
+
+            # update step
+            if alpha > 1/sq2
+                beta = sq2pi * Nz/sigma * exp(-alpha*alpha)   # damping strength
+                beta1 = wk.beta1[ij]
+                # uu1[ij] b/c it needs to be the same wave, not the same rank
+                wk.uu[ij] = wk.uu1[ij] * m/m1 * exp(-0.5*(beta+beta1)*dz)
+                wk.beta1[ij] = beta
+            else
+                # exp(-alpha^2) is an approximation to erfi(alpha)[erfi(alpha)^2-1]^-0.5
+                # which goes violently to 0 around alpha = 1/sqrt(2)
+                wk.uu[ij] = 0.0
+                wk.beta1[ij] = Inf
+            end
+
+            # update flux in the column
+            th = x[3ij-2]
+            flux_out[zi]    += cos(th)*K/m*wk.uu[ij]
+            flux_out[zi+nz] += sin(th)*K/m*wk.uu[ij]
+        end
+    end
+    resize!(wk.m, lenm)
+    resize!(wk.idxs, lenm)
+    return nothing
 end

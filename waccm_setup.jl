@@ -13,7 +13,7 @@ include("wrf-utils.jl")
 include("L81-2.jl")
 
 nt = 32
-tb = 30 #rand(1:(2920-nt))  #800
+tb = rand(1:(2920-nt))  #800
 te = tb + nt
 zb = 5      
 ze = 65      
@@ -22,4 +22,4 @@ ye = 96+8     # close to -15 degrees    # 66 for 30N
 xb = 1
 xe = 288
 
-waccm_ds = load_waccm_stack([xb, yb, zb, tb], [xe, ye, ze, te]; wtype="O");  # all GW is "OFC"
+waccm_ds = load_waccm_stack([xb, yb, zb, tb], [xe, ye, ze, te]; wtype="OFC", separate=true);

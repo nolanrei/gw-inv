@@ -3,6 +3,71 @@ using Dates
 using DimensionalData
 using Statistics
 
+function annulus_heatmap(x, nx; r0=5.0, ep=0.3, n=200, cmax=nothing)
+    nw = div(nx, 3)
+
+    if isnothing(cmax)
+        cmax = maximum(x[2:3:nx-1])
+    end
+
+    # 1. Annulus map
+    rmap(r) = hypot(r,r0)
+
+    # 2. Extract wave dot coordinates (Cartesian) and weights
+    dots = zeros(nw, 2)
+    weights = zeros(nw)
+    for i = 1:nw
+        th = x[3i-2]
+        c  = rmap(x[3i-1])    # <-- maps to an annulus
+        dots[i, 1] = c * cos(th)
+        dots[i, 2] = c * sin(th)
+        weights[i] = x[3i] # Wave weight/amplitude
+    end
+
+    # 3. Build 2D Cartesian grid spanning [-cmax, cmax]
+    grid_1d = range(-cmax, cmax, length=n)
+    map_2d = zeros(n, n)
+    ep2 = ep * ep
+
+    # 3.5 NaN out central ring so it's never plotted
+    nanidxs = findall(grid_1d.^2 .+ (grid_1d').^2 .< r0^2)
+    map_2d[nanidxs] .= NaN
+
+    # 4. Evaluate RBF on Cartesian grid
+    for i in 1:n        # X index (columns)
+        x_val = grid_1d[i]
+        for j in 1:n    # Y index (rows)
+            y_val = grid_1d[j]
+            
+            # Mask out points outside the disk radius
+            if x_val^2 + y_val^2 > cmax^2
+                map_2d[j, i] = NaN
+                continue
+            end
+
+            # Accumulate RBF sum
+            val = 0.0
+            for k in 1:nw
+                dx = x_val - dots[k, 1]
+                dy = y_val - dots[k, 2]
+                r2 = dx*dx + dy*dy
+                val += weights[k] * exp(-ep2 * r2)
+            end
+            map_2d[j, i] = val
+        end
+    end
+
+    # 5. Plot Cartesian heatmap bounded into a clean circle
+    p = heatmap(grid_1d, grid_1d, map_2d, 
+                aspect_ratio = :equal, 
+                color = :Blues, 
+                xlims = (-cmax*1.05, cmax*1.05), 
+                ylims = (-cmax*1.05, cmax*1.05))
+
+    return p
+    
+end
+
 function rosette(x,nx)
     nw = div(nx,3)
     r = zeros(nw)
@@ -93,6 +158,23 @@ function rosette_heatmap(x, nx; ep=0.3, n=200, cmax=nothing)
     return p
 end
 
+function spectrum_com(x,nx)
+    # Compute Center Of Mass for a given spectrum
+    nw = div(nx,3)
+    com = zeros(2)
+    fsum = 0.0
+    for i = 1:nw
+        th = x[3i-2]
+        c  = x[3i-1]
+        f  = x[3i]
+        cvec = c*SA[cos(th), sin(th)]
+        com .+= f*cvec
+        fsum += f
+    end
+    com ./= fsum
+    return com
+end
+
 function gaussian_rbf(xx,x,y,ep)
     nxx = size(xx,1)
     ny  = length(y)   # x and y should be the same length
@@ -105,7 +187,8 @@ function gaussian_rbf(xx,x,y,ep)
         for j = 1:ny
             xj = selectdim(x,1,j)
             r2 = sum(abs2, xxi.-xj)
-            out[i] += y[j]*exp(-ep2*r2)
+            norm0 = pi/ep2
+            out[i] += y[j]*norm0*exp(-ep2*r2)
         end
     end
     return out
@@ -113,9 +196,25 @@ end
 
 function flatten_ragged(xs)
     # turn a ragged array into a flat array and an array of offsets
-    offsets = [0; cumsum(length.(xs))]
-    data = reduce(vcat, xs; init=eltype(first(xs))[])
+    xs2 = something.(xs, Ref([NaN]))
+    offsets = [0; cumsum(length.(xs2))]
+    data = reduce(vcat, xs2; init=eltype(first(xs2))[])
     return data, offsets
+end
+
+function flatten_square(xs, nxs)
+    nsamp = length(nxs)
+    nxt = sum(nxs)
+    offsets = zeros(nsamp+1)
+    out = zeros(nxt)
+    idx = 0
+    for i = 1:nsamp
+        nx = nxs[i]
+        out[idx+1:idx+nx] .= view(xs,i,1:nx)
+        idx += nx
+        offsets[i+1] = idx
+    end
+    return out, offsets
 end
 
 function unflatten_ragged(data, offsets)
@@ -123,6 +222,19 @@ function unflatten_ragged(data, offsets)
         data[offsets[i]+1 : offsets[i+1]]
         for i in 1:length(offsets)-1
     ]
+end
+
+function unflatten_square(data, offsets)
+    max_nx = maximum(offsets)
+    nsamp = length(offsets)-1
+    out = zeros(nsamp, max_nx)
+    nxs = zeros(Int64, nsamp)
+    for i in 1:nsamp
+        nx = offsets[i+1] - offsets[i]
+        nxs[i] = nx
+        out[i,1:nx] .= data[offsets[i]+1 : offsets[i+1]]
+    end
+    return out, nxs
 end
 
 function src_check(x,nx,fluxvec,U,V,iz; thresh=12.0, cutoff_ang=pi/6)
@@ -468,6 +580,165 @@ function get_wrf_files(case::Int)
     return sort_by_date(u_files), sort_by_date(uw_files), sort_by_date(vw_files)
 end
 
+function diff_precip(precip::AbstractArray{Float64,3}, time_coords::AbstractVector{DateTime})
+    # Precip comes as an accumulator and we want a rate
+    # It also has Gibbs artifacts that we need to get rid of
+    nx, ny, nt = size(precip)
+
+    rate = zeros(nx,ny,nt)
+    rate[:,:,2:end] .= diff(precip, dims=3)
+    rate[:,:,1] .= rate[:,:,2]    # no-strain BCs (precip amt is from start of sim, not start of dataset)
+
+    dt_hr = zeros(nt)
+    for i = 2:nt
+        dt_hr[i] = Dates.value(time_coords[i] - time_coords[i-1]) / (1000*3600)    # ms -> hours
+    end
+    dt_hr[1] = dt_hr[2]
+
+    # simple mask -- rate can't be negative
+    for i=1:nx, j=1:ny, k=1:nt
+        rate[i,j,k] = max(0.0,rate[i,j,k]/dt_hr[k])
+    end
+    return rate
+end
+
+"""
+    dt1d_l1_labeled!(f, pos, label)
+
+In-place 1D L1 (taxicab) distance transform. `f[p]=0.0` at sources, `Inf`
+elsewhere going in. Forward pass propagates the best cost rightward
+(cost to reach q from the best candidate at or to its left); backward
+pass does the same leftward. Combined, every q ends up with the true
+min over ALL candidates -- min-plus arithmetic, so Inf can never turn
+into NaN the way it did with the parabola/division approach.
+"""
+function dt1d_l1_labeled!(f::AbstractVector{Float64}, pos::AbstractVector{Float64}, label::AbstractVector{T}) where T
+     @assert issorted(pos) "dt1d_l1_labeled!: pos must be sorted increasing (got non-monotonic input -- check your lon/lat axis convention)"
+    n = length(f)
+    @inbounds for q = 2:n
+        cand = f[q-1] + (pos[q]-pos[q-1])
+        if cand < f[q]
+            f[q] = cand
+            label[q] = label[q-1]
+        end
+    end
+    @inbounds for q = n-1:-1:1
+        cand = f[q+1] + (pos[q+1]-pos[q])
+        if cand < f[q]
+            f[q] = cand
+            label[q] = label[q+1]
+        end
+    end
+    return f, label
+end
+
+function convective_distance_strength_slice!(dist::AbstractMatrix{Float64}, strength::AbstractMatrix{Float64},
+        rate::AbstractMatrix{Float64}, x_km::AbstractMatrix{Float64}, y_km::AbstractVector{Float64};
+        thresh::Float64=4.0)
+    nx, ny = size(rate)
+    fcol, lcol = zeros(ny), zeros(ny)
+    g, gval = zeros(nx, ny), zeros(nx, ny)
+
+    for i = 1:nx
+        for j = 1:ny
+            fcol[j], lcol[j] = rate[i,j] > thresh ? (0.0, rate[i,j]) : (Inf, NaN)
+        end
+        dt1d_l1_labeled!(fcol, y_km, lcol)
+        g[i, :] .= fcol
+        gval[i, :] .= lcol
+    end
+
+    frow, lrow = zeros(nx), zeros(nx)
+    for j = 1:ny
+        frow .= view(g, :, j); lrow .= view(gval, :, j)
+        dt1d_l1_labeled!(frow, view(x_km, :, j), lrow)
+        for i = 1:nx
+            dist[i,j], strength[i,j] = isnan(lrow[i]) ? (NaN, NaN) : (frow[i], lrow[i])
+        end
+    end
+    return nothing
+end
+
+function convective_distance_strength(rate::AbstractArray{Float64,3}, lon::AbstractArray{Float64}, 
+        lat::AbstractArray{Float64};
+        thresh::Float64=4.0, km_per_deg::Float64=111.32)
+    nx, ny, nt = size(rate)
+    y_km = km_per_deg .* lat[1, :]              # assumes lat constant along i (see caveat below)
+    x_km = km_per_deg .* lon .* cosd.(lat)      # per-row scaling: km/degree-lon shrinks with cos(lat)
+
+    dist, strength = zeros(nx, ny, nt), zeros(nx, ny, nt)
+    for ti = 1:nt
+        convective_distance_strength_slice!(view(dist,:,:,ti), view(strength,:,:,ti),
+            view(rate,:,:,ti), x_km, y_km; thresh)
+    end
+    return dist, strength
+end
+
+"""
+    convective_spacetime_distance(dist, strength, time_coords; km_per_hr=75.0, max_lag_hr=2.0)
+
+Given per-slice SPATIAL nearest-convection distance/strength (from
+`convective_distance_strength`), returns a complex spacetime distance
+z = d_space + i*(km_per_hr * τ) to the nearest convective cell over all
+causal lags 0 ≤ τ ≤ max_lag_hr, plus that cell's strength.
+
+Exact: for fixed lag the time term is constant, so the nearest source at
+that lag is the spatially-nearest one in slice t-τ. Minimizing |z| over
+the (≤ 9) available lags gives the global spacetime minimum.
+
+real(z) > 0 → separated in space; imag(z) > 0 → separated in time.
+NaN+NaN*im where no convective cell exists in any slice within the window.
+Ties go to the most recent lag.
+"""
+function convective_spacetime_distance(dist::AbstractArray{Float64,3}, strength::AbstractArray{Float64,3},
+        time_coords::AbstractVector{DateTime}; km_per_hr::Float64=75.0, max_lag_hr::Float64=2.0)
+    @assert issorted(time_coords) "time_coords must be increasing for the causal lag search"
+    nx, ny, nt = size(dist)
+    zdist = fill(complex(NaN, NaN), nx, ny, nt)
+    zstr  = fill(NaN, nx, ny, nt)
+    for t = 1:nt
+        for t0 = t:-1:1                                    # causal: sources at or before t
+            τ = Dates.value(time_coords[t] - time_coords[t0]) / 3.6e6   # ms -> hours
+            τ > max_lag_hr && break                        # beyond the cutoff: stop looking back
+            dt_km = km_per_hr * τ
+            @inbounds for j = 1:ny, i = 1:nx
+                ds = dist[i,j,t0]
+                isnan(ds) && continue                      # no convection anywhere in slice t0
+                z = complex(ds, dt_km)
+                if isnan(zdist[i,j,t]) || abs(z) < abs(zdist[i,j,t])
+                    zdist[i,j,t] = z
+                    zstr[i,j,t]  = strength[i,j,t0]
+                end
+            end
+        end
+    end
+    return zdist, zstr
+end
+
+function fix_lon!(lon::AbstractVector{Float64})
+    # Fix the ringing and artifacts from erroneously averaging over longitude branch cut
+    nl = length(lon)
+
+    # Discard any diff larger than maxD and compute the mean increase
+    maxD = 0.5
+    mid = 0.9
+    mni = 0.0
+    count = 0
+    for i = 1:nl-1
+        dlon = lon[i+1] - lon[i]
+        if abs(dlon-mid) < maxD
+            mni += dlon
+            count += 1
+        end
+    end
+    mni /= count
+    
+    for i = 2:nl
+        lon[i] = lon[1] + (i-1)*mni
+    end
+    return nothing
+end
+
 """
     load_wrf_case(case::Int) -> DimStack
 
@@ -482,6 +753,7 @@ function load_wrf_case(case::Int)
     v_raw  = cat([ncread(f, "v1deg") for f in u_files]..., dims=4) # V resides in U files
     uw_raw = cat([ncread(f, "rey_g") for f in uw_files]..., dims=4)
     vw_raw = cat([ncread(f, "rey_g") for f in vw_files]..., dims=4)
+    precip_raw = cat([ncread(f, "precip") for f in u_files]..., dims=3)   # (lon, lat, time)
     
     # 2. Build time axis
     time_coords = DateTime[]
@@ -529,6 +801,15 @@ function load_wrf_case(case::Int)
     lon_raw = ncread(u_files[1], "lon")
     lat_raw = ncread(u_files[1], "lat")
 
+    # OLR and topography
+    olr_raw  = cat([ncread(f, "olr") for f in u_files]..., dims=3)   # (lon, lat, time), W/m^2
+    
+    topo_raw = ncread(u_files[1], "topo")                             # (lon, lat, time), static in principle
+    topo_data = ndims(topo_raw) == 3 ? topo_raw[:, :, 1] : topo_raw
+    if ndims(topo_raw) == 3 && maximum(abs, topo_raw .- topo_raw[:, :, 1:1]) > 1e-6
+        @warn "load_wrf_case: topo varies in time within $(u_files[1]); storing only the first timestep"
+    end
+
     # Define a flexible spatial_dims function that accepts the Z dimension as an argument
     spatial_dims(Z_dim) = (X(1:nx), Y(1:ny), Z_dim, Ti(time_coords))
 
@@ -553,9 +834,26 @@ function load_wrf_case(case::Int)
     # 1D/2D Metadata
     lon_dims = ndims(lon_data) == 1 ? (X(1:nx),) : (X(1:nx), Y(1:ny))
     lat_dims = ndims(lat_data) == 1 ? (Y(1:ny),) : (X(1:nx), Y(1:ny))
-    
+
+    # OLR/topo
+    da_olr  = DimArray(olr_raw,   (X(1:nx), Y(1:ny), Ti(time_coords)); name=:olr)
+    da_topo = DimArray(topo_data, (X(1:nx), Y(1:ny));                  name=:topo)
+
+    for i = 1:ny
+        fix_lon!(view(lon_data,:,i))
+    end
     da_lon = DimArray(lon_data, lon_dims; name=:lon)
     da_lat = DimArray(lat_data, lat_dims; name=:lat)
+
+    # 3D Data (precip)
+    precip = diff_precip(precip_raw, time_coords)
+    conv_dist, conv_strength = convective_distance_strength(precip, lon_data, lat_data; thresh=4.0)
+    conv_zdist, conv_zstrength = convective_spacetime_distance(conv_dist, conv_strength, time_coords)
+    da_precip        = DimArray(precip,        (X(1:nx), Y(1:ny), Ti(time_coords)); name=:precip)
+    da_conv_dist     = DimArray(conv_dist,     (X(1:nx), Y(1:ny), Ti(time_coords)); name=:conv_dist_km)
+    da_conv_strength = DimArray(conv_strength, (X(1:nx), Y(1:ny), Ti(time_coords)); name=:conv_strength)
+    da_conv_zdist     = DimArray(conv_zdist,     (X(1:nx), Y(1:ny), Ti(time_coords)); name=:conv_dist_st)
+    da_conv_zstrength = DimArray(conv_zstrength, (X(1:nx), Y(1:ny), Ti(time_coords)); name=:conv_strength_st)
     
     # Distinct dimensions for index-based and raw metadata profiles
     da_iz  = DimArray(iz,       (Dim{:Z_iz}(1:65),); name=:iz)
@@ -564,8 +862,10 @@ function load_wrf_case(case::Int)
     da_N   = DimArray(N_meta,   (Dim{:Z_meta}(1:length(N_meta)),);   name=:N)
     
     return DimStack(da_Up, da_Vp, da_Ur, da_Vr, da_UW, da_VW, da_DX, da_DY, 
-                    da_lon, da_lat, da_iz, da_oz, da_rho, da_N; 
-                    metadata=Dict("case" => case, "source" => "WRF"))
+                da_lon, da_lat, da_iz, da_oz, da_rho, da_N,
+                da_precip, da_conv_dist, da_conv_strength,
+                da_conv_zdist, da_conv_zstrength, da_olr, da_topo; 
+                metadata=Dict("case" => case, "source" => "WRF"))
 end
 
 # One last DimStack function -- WRF has N/rho as single columns, WACCM has 4D arrays
@@ -578,7 +878,8 @@ end
     return selectors
 end
 
-function sample_existing_dims!(target_col::AbstractVector{Float64}, ds::DimStack, key, xi::Int, yi::Int, ti::Int)
+function sample_existing_dims!(target_col::AbstractVector{Float64}, ds::DimStack, 
+        key, xi::Integer, yi::Integer, ti::Integer)
     A = ds[key]
     selectors = existing_selectors(A, xi, yi, ti)
     

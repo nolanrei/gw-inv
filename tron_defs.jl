@@ -29,7 +29,7 @@ function GWFit(waves, col, fluxvec; lambda=1e-5, wndw=nothing)
     der2 = zeros(2nz, nw)
     gi = zeros(2nz)
 
-    x0 = 1e-7 .+ 1e-6 .* rand(nw)   # starting condition
+    x0 = 1e-5 .+ 1e-4 .* rand(nw)   # starting condition
 
     # makes high-speed waves more expensive in the optimization
     wts = zeros(nw)
@@ -384,4 +384,3 @@ function L81_hess!(wav::WaveProfile, col::ColumnProfile, alpha, d2G_dxi2)
         bb = bt
     end
 end
-
